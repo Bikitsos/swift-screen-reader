@@ -9,14 +9,16 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -32,17 +35,19 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, CLI_EXE_NAME, COMPANY, CREDITS, EXE_NAME, __version__, build_info, config, ipc, pipe_name
-from .config import DEFAULT_FILE_NAME, Area
+from .config import DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, Area
+from .hotkeys import HotkeyManager, display
 from .selector import AreaHighlight, AreaSelector
 from .service import CaptureService
 from .updater import Release, UpdateChecker, UpdateDownloader, can_self_update, is_newer, run_installer
 
 COORD_LIMIT = 100_000
+CAPTURE, SELECT = "Capture now", "Select area"
+PORTABLE = QKeySequence.SequenceFormat.PortableText
 
 
 def _hint(text: str) -> QLabel:
     label = QLabel(text)
-    label.setWordWrap(True)
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     label.setStyleSheet("color: #777;")
     return label
@@ -85,11 +90,14 @@ class MainWindow(QMainWindow):
     def __init__(self, log_emitter: LogEmitter) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(640, 680)
+        self.resize(760, 690)
         self.settings = config.load()
         self.service = CaptureService(self.settings, self)
+        self.hotkeys = HotkeyManager(self)
+        self.hotkeys.triggered.connect(self._on_hotkey)
         self.last_path: str | None = None
         self._selector: AreaSelector | None = None
+        self._service_started = False
         self._loading = False
         self._tray_hint_shown = False
         self._tray_click = self.open_last
@@ -112,6 +120,7 @@ class MainWindow(QMainWindow):
         self.service.captured.connect(self._on_captured)
         self.service.failed.connect(self._on_failed)
         self.service.command.connect(self._on_command)
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
 
     # -- UI -------------------------------------------------------------------
 
@@ -176,8 +185,8 @@ class MainWindow(QMainWindow):
         self.name_edit.setPlaceholderText(DEFAULT_FILE_NAME)
         self.name_edit.textChanged.connect(self._schedule_save)
         form.addRow("File name:", self.name_edit)
-        form.addRow("", _hint("Placeholders: {timestamp}, {date}, {time}. Use a fixed name such as latest.png "
-                              "to overwrite the same file on every capture."))
+        form.addRow("", _hint("Placeholders: {timestamp}, {date}, {time}.\n"
+                              "A fixed name such as latest.png is overwritten on every capture."))
         self.clipboard_check = QCheckBox("Also copy the screenshot to the clipboard")
         self.clipboard_check.toggled.connect(self._schedule_save)
         self.notify_check = QCheckBox("Show a notification after each capture")
@@ -186,6 +195,25 @@ class MainWindow(QMainWindow):
         form.addRow("", self.notify_check)
         layout.addWidget(output_box)
 
+        keys_box = QGroupBox("Keyboard shortcuts (work anywhere, also while the app is in the tray)")
+        keys_form = QFormLayout(keys_box)
+        self.hotkey_edits: dict[str, QKeySequenceEdit] = {}
+        for name, default in ((CAPTURE, DEFAULT_HOTKEY_CAPTURE), (SELECT, DEFAULT_HOTKEY_SELECT)):
+            edit = QKeySequenceEdit()
+            edit.setMaximumSequenceLength(1)
+            edit.setClearButtonEnabled(True)
+            edit.editingFinished.connect(self._schedule_save)
+            edit.keySequenceChanged.connect(self._schedule_save)
+            reset = QPushButton("Default")
+            reset.clicked.connect(lambda _=False, e=edit, d=default: self._reset_hotkey(e, d))
+            row = QHBoxLayout()
+            row.addWidget(edit, 1)
+            row.addWidget(reset)
+            keys_form.addRow(f"{name}:", row)
+            self.hotkey_edits[name] = edit
+        self.hotkey_status = QLabel()
+        keys_form.addRow("", self.hotkey_status)
+        layout.addWidget(keys_box)
         service_box = QGroupBox("Service")
         service_form = QFormLayout(service_box)
         self.status_label = QLabel()
@@ -205,8 +233,8 @@ class MainWindow(QMainWindow):
         self.update_check.toggled.connect(self._schedule_save)
         service_form.addRow("", self.update_check)
         service_form.addRow("", _hint(
-            f"Call it with {CLI_EXE_NAME}.exe (prints the saved file path), {EXE_NAME}.exe --capture, "
-            "or GET http://127.0.0.1:<port>/capture (JSON with the path) or /capture.png (the image)."
+            f"Call it with the shortcuts above, {CLI_EXE_NAME}.exe (prints the saved path),\n"
+            f"{EXE_NAME}.exe --capture, or GET http://127.0.0.1:<port>/capture or /capture.png."
         ))
         layout.addWidget(service_box)
 
@@ -214,11 +242,17 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(1000)
+        self.log_view.setMinimumHeight(60)
         layout.addWidget(self.log_view, 1)
         credits = QLabel(CREDITS)
         credits.setStyleSheet("color: #777;")
         layout.addWidget(credits)
-        self.setCentralWidget(central)
+        # Scroll instead of squashing the controls on small or highly scaled screens.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(central)
+        self.setCentralWidget(scroll)
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self._icon_off, self)
@@ -229,7 +263,8 @@ class MainWindow(QMainWindow):
         bold.setFont(font)
         bold.triggered.connect(self.capture_now)
         menu.addAction(bold)
-        menu.addAction("Select area...", self.select_area)
+        select = menu.addAction("Select area...", self.select_area)
+        self._tray_actions = {CAPTURE: (bold, "Capture now"), SELECT: (select, "Select area...")}
         menu.addAction("Show area", self.show_area)
         menu.addAction("Open screenshots folder", self.open_folder)
         menu.addSeparator()
@@ -259,6 +294,8 @@ class MainWindow(QMainWindow):
         self.http_check.setChecked(s.http_enabled)
         self.port_spin.setValue(s.http_port)
         self.update_check.setChecked(s.check_updates)
+        self.hotkey_edits[CAPTURE].setKeySequence(QKeySequence.fromString(s.hotkey_capture, PORTABLE))
+        self.hotkey_edits[SELECT].setKeySequence(QKeySequence.fromString(s.hotkey_select, PORTABLE))
         self._loading = False
         self._update_area_label()
 
@@ -273,6 +310,8 @@ class MainWindow(QMainWindow):
         s.http_enabled = self.http_check.isChecked()
         s.http_port = self.port_spin.value()
         s.check_updates = self.update_check.isChecked()
+        s.hotkey_capture = self.hotkey_edits[CAPTURE].keySequence().toString(PORTABLE)
+        s.hotkey_select = self.hotkey_edits[SELECT].keySequence().toString(PORTABLE)
         self._save_timer.start()
 
     def _save_settings(self) -> None:
@@ -317,6 +356,50 @@ class MainWindow(QMainWindow):
         self.service.restart_http()
         self._update_status()
 
+    # -- keyboard shortcuts ---------------------------------------------------
+
+    def _is_hotkey_widget(self, widget: QWidget | None) -> bool:
+        return widget is not None and any(e is widget or e.isAncestorOf(widget) for e in self.hotkey_edits.values())
+
+    def _on_focus_changed(self, old: QWidget | None, now: QWidget | None) -> None:
+        was, is_ = self._is_hotkey_widget(old), self._is_hotkey_widget(now)
+        if is_ and not was:
+            # Pause the global shortcuts while recording, or pressing the current one would trigger it.
+            self.hotkeys.stop()
+        elif was and not is_:
+            self.apply_hotkeys()
+
+    def _reset_hotkey(self, edit: QKeySequenceEdit, default: str) -> None:
+        edit.setKeySequence(QKeySequence.fromString(default, PORTABLE))
+        self.apply_hotkeys()
+
+    def apply_hotkeys(self) -> None:
+        if not self._service_started:
+            return
+        shortcuts = {CAPTURE: self.settings.hotkey_capture, SELECT: self.settings.hotkey_select}
+        errors = self.hotkeys.apply(shortcuts)
+        active = [f"{name}: {display(text)}" for name, text in shortcuts.items() if text and name not in errors]
+        if errors:
+            self.hotkey_status.setStyleSheet("color: #c62828;")
+            self.hotkey_status.setText("\n".join(errors.values()))
+        elif active:
+            self.hotkey_status.setStyleSheet("color: #2e7d32;")
+            self.hotkey_status.setText("Active. Click a box and press new keys to change; clear it to turn it off.")
+        else:
+            self.hotkey_status.setStyleSheet("color: #777;")
+            self.hotkey_status.setText("No shortcuts set.")
+        for name, (action, label) in self._tray_actions.items():
+            text = shortcuts[name]
+            action.setText(f"{label}\t{display(text)}" if text and name not in errors else label)
+
+    def _on_hotkey(self, name: str) -> None:
+        if self._selector is not None:
+            return
+        if name == CAPTURE:
+            self.capture_now()
+        elif name == SELECT:
+            self.select_area()
+
     def _update_status(self) -> None:
         parts = [f"Running. Pipe \\\\.\\pipe\\{pipe_name()}"]
         if self.service.http_running:
@@ -337,7 +420,9 @@ class MainWindow(QMainWindow):
     def start_service(self) -> bool:
         if not self.service.start():
             return False
+        self._service_started = True
         self._update_status()
+        self.apply_hotkeys()
         return True
 
     def _on_command(self, cmd: str) -> None:
@@ -549,6 +634,8 @@ class MainWindow(QMainWindow):
             self._save_timer.stop()
             self._save_settings()
         self.service.stop()
+        self.hotkeys.stop()
+        QApplication.instance().focusChanged.disconnect(self._on_focus_changed)
         self.tray.hide()
         QApplication.quit()
 

@@ -8,7 +8,8 @@ Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https
 
 - Drag-select the capture area once over a dimmed screen; it is remembered in physical pixels and works with multiple monitors and mixed scaling (100%, 150%, 200%...)
 - Resident tray service, started with Windows by the installer, that answers capture calls immediately
-- Three ways to call it:
+- Global keyboard shortcuts that work anywhere, also while the app is hidden in the tray (default **Ctrl+Shift+F9** capture, **Ctrl+Shift+F10** select area; configurable)
+- Other ways to call it:
   - `SwiftScreenReaderCli.exe`: console tool that prints the saved file path (Qt-free, starts fast)
   - `SwiftScreenReader.exe --capture`: same, for launchers and shortcuts that want a windowed exe
   - `http://127.0.0.1:8765/capture` (JSON with the path) or `/capture.png` (the image itself, nothing saved)
@@ -49,6 +50,15 @@ uv run screen-reader-gui --select     # start by selecting the capture area
 - You can also type the area (X, Y, width, height in physical pixels) directly in the window.
 
 Settings are saved to `%APPDATA%\Swift Screen Reader\settings.json`.
+
+### Keyboard shortcuts
+
+| Shortcut (default) | Action |
+| --- | --- |
+| **Ctrl+Shift+F9** | Capture the area now (asks you to select one first if none is set) |
+| **Ctrl+Shift+F10** | Select a new capture area |
+
+They are system-wide: they work in any program while the app runs, even hidden in the tray. To change one, click its box in the window and press the new keys; the **×** turns it off and **Default** restores it. A shortcut needs Ctrl, Alt or Win plus a letter, digit, F-key or navigation key; F1-F24, Print and Pause also work on their own. If another program already uses a combination, the window shows it in red and you can pick a different one. The tray menu lists the active shortcuts.
 
 ### Taking a screenshot
 
@@ -168,6 +178,7 @@ src/swift_screen_reader/
   cli.py       command line (SwiftScreenReaderCli.exe)
   launcher.py  SwiftScreenReader.exe entry: --capture, or the tray app
   service.py   resident service: named pipe server and HTTP endpoint
+  hotkeys.py   system-wide keyboard shortcuts (RegisterHotKey)
   selector.py  area selection overlay and area highlight
   gui.py       tray app and window
   updater.py   update check, download and install from GitHub Releases

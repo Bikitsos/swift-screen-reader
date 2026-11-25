@@ -14,6 +14,8 @@ from . import data_dir, default_screenshots_dir
 
 DEFAULT_FILE_NAME = "screenshot_{timestamp}.png"
 DEFAULT_HTTP_PORT = 8765
+DEFAULT_HOTKEY_CAPTURE = "Ctrl+Shift+F9"
+DEFAULT_HOTKEY_SELECT = "Ctrl+Shift+F10"
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,8 @@ class Settings:
     notify: bool = False
     http_enabled: bool = True
     http_port: int = DEFAULT_HTTP_PORT
+    hotkey_capture: str = DEFAULT_HOTKEY_CAPTURE
+    hotkey_select: str = DEFAULT_HOTKEY_SELECT
     check_updates: bool = True
     extra: dict = field(default_factory=dict, repr=False)
 
