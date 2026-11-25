@@ -1,0 +1,24 @@
+[project]
+name = "swift-screen-reader"
+dynamic = ["version"]
+description = "Windows tray service that saves a screenshot of a preselected screen area whenever it is called"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6-Essentials>=6.6",
+]
+
+[project.scripts]
+screen-reader = "swift_screen_reader.cli:main"
+
+[project.gui-scripts]
+screen-reader-gui = "swift_screen_reader.launcher:main"
+
+[dependency-groups]
+build = ["pyinstaller>=6.10"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/swift_screen_reader/__init__.py"

@@ -1,0 +1,19 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# App output
+screenshots/
+
+# Build output (PyInstaller, Inno Setup); screen-reader.spec is tracked on purpose
+build/
+dist/
+src/swift_screen_reader/_build_info.py
+
+# OS / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
