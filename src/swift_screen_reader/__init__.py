@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 # Single source of truth for the version; bump with `python scripts/bump_version.py`.
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 APP_NAME = "Swift Screen Reader"
 EXE_NAME = "SwiftScreenReader"
