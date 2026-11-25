@@ -16,6 +16,7 @@ DEFAULT_FILE_NAME = "screenshot_{timestamp}.png"
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_HOTKEY_CAPTURE = "Ctrl+Shift+F9"
 DEFAULT_HOTKEY_SELECT = "Ctrl+Shift+F10"
+DEFAULT_PROCESSING_TEXT = "Processing..."
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,9 @@ class Settings:
     http_port: int = DEFAULT_HTTP_PORT
     hotkey_capture: str = DEFAULT_HOTKEY_CAPTURE
     hotkey_select: str = DEFAULT_HOTKEY_SELECT
+    processing_enabled: bool = True
+    processing_seconds: int = 5
+    processing_text: str = DEFAULT_PROCESSING_TEXT
     check_updates: bool = True
     extra: dict = field(default_factory=dict, repr=False)
 

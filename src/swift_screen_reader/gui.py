@@ -35,8 +35,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, CLI_EXE_NAME, COMPANY, CREDITS, EXE_NAME, __version__, build_info, config, ipc, pipe_name
-from .config import DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, Area
+from .config import DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, DEFAULT_PROCESSING_TEXT, Area
 from .hotkeys import HotkeyManager, display
+from .overlay import ProcessingOverlay
 from .selector import AreaHighlight, AreaSelector
 from .service import CaptureService
 from .updater import Release, UpdateChecker, UpdateDownloader, can_self_update, is_newer, run_installer
@@ -118,6 +119,8 @@ class MainWindow(QMainWindow):
         logging.info("%s %s (%s)", APP_NAME, __version__, build_info()[0])
 
         self.service.captured.connect(self._on_captured)
+        self.service.grabbed.connect(self._on_grabbed)
+        self.processing = ProcessingOverlay(self)
         self.service.failed.connect(self._on_failed)
         self.service.command.connect(self._on_command)
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
@@ -193,6 +196,21 @@ class MainWindow(QMainWindow):
         self.notify_check.toggled.connect(self._schedule_save)
         form.addRow("", self.clipboard_check)
         form.addRow("", self.notify_check)
+        cover_row = QHBoxLayout()
+        self.processing_check = QCheckBox("After each capture, cover the screen for")
+        self.processing_check.toggled.connect(self._schedule_save)
+        self.processing_spin = QSpinBox()
+        self.processing_spin.setRange(1, 60)
+        self.processing_spin.setSuffix(" s")
+        self.processing_spin.valueChanged.connect(self._schedule_save)
+        self.processing_edit = QLineEdit()
+        self.processing_edit.setPlaceholderText(DEFAULT_PROCESSING_TEXT)
+        self.processing_edit.textChanged.connect(self._schedule_save)
+        cover_row.addWidget(self.processing_check)
+        cover_row.addWidget(self.processing_spin)
+        cover_row.addWidget(QLabel("showing"))
+        cover_row.addWidget(self.processing_edit, 1)
+        form.addRow("", cover_row)
         layout.addWidget(output_box)
 
         keys_box = QGroupBox("Keyboard shortcuts (work anywhere, also while the app is in the tray)")
@@ -296,6 +314,9 @@ class MainWindow(QMainWindow):
         self.update_check.setChecked(s.check_updates)
         self.hotkey_edits[CAPTURE].setKeySequence(QKeySequence.fromString(s.hotkey_capture, PORTABLE))
         self.hotkey_edits[SELECT].setKeySequence(QKeySequence.fromString(s.hotkey_select, PORTABLE))
+        self.processing_check.setChecked(s.processing_enabled)
+        self.processing_spin.setValue(s.processing_seconds)
+        self.processing_edit.setText("" if s.processing_text == DEFAULT_PROCESSING_TEXT else s.processing_text)
         self._loading = False
         self._update_area_label()
 
@@ -312,6 +333,9 @@ class MainWindow(QMainWindow):
         s.check_updates = self.update_check.isChecked()
         s.hotkey_capture = self.hotkey_edits[CAPTURE].keySequence().toString(PORTABLE)
         s.hotkey_select = self.hotkey_edits[SELECT].keySequence().toString(PORTABLE)
+        s.processing_enabled = self.processing_check.isChecked()
+        s.processing_seconds = self.processing_spin.value()
+        s.processing_text = self.processing_edit.text().strip() or DEFAULT_PROCESSING_TEXT
         self._save_timer.start()
 
     def _save_settings(self) -> None:
@@ -444,6 +468,11 @@ class MainWindow(QMainWindow):
         if self.settings.notify:
             self._tray_click = self.open_last
             self.tray.showMessage(APP_NAME, f"Saved {Path(path).name}", QSystemTrayIcon.MessageIcon.Information, 2000)
+
+    def _on_grabbed(self) -> None:
+        s = self.settings
+        if s.processing_enabled:
+            self.processing.show(s.processing_text or DEFAULT_PROCESSING_TEXT, s.processing_seconds)
 
     def _on_failed(self, error: str) -> None:
         logging.error("Capture failed: %s", error)
@@ -635,6 +664,7 @@ class MainWindow(QMainWindow):
             self._save_settings()
         self.service.stop()
         self.hotkeys.stop()
+        self.processing.hide()
         QApplication.instance().focusChanged.disconnect(self._on_focus_changed)
         self.tray.hide()
         QApplication.quit()

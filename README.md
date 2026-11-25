@@ -17,6 +17,7 @@ Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https
 - PNG output to a folder of your choice, with a file name pattern (`{timestamp}`, `{date}`, `{time}`) or a fixed name such as `latest.png` that is overwritten on each capture
 - Files are written atomically, so a program watching the folder never reads a half-written image
 - Optional copy to the clipboard and tray notification after each capture
+- After each capture, the screen is covered with a "Processing..." message for 5 seconds that blocks the mouse and keyboard (on by default; duration and text configurable)
 - "Show area" briefly outlines the current capture area on screen
 - In-app updates from GitHub Releases
 
@@ -59,6 +60,10 @@ Settings are saved to `%APPDATA%\Swift Screen Reader\settings.json`.
 | **Ctrl+Shift+F10** | Select a new capture area |
 
 They are system-wide: they work in any program while the app runs, even hidden in the tray. To change one, click its box in the window and press the new keys; the **×** turns it off and **Default** restores it. A shortcut needs Ctrl, Alt or Win plus a letter, digit, F-key or navigation key; F1-F24, Print and Pause also work on their own. If another program already uses a combination, the window shows it in red and you can pick a different one. The tray menu lists the active shortcuts.
+
+### Processing screen
+
+After every capture made through the running app (shortcut, **Capture now**, the command line or HTTP), every monitor is covered with a dark screen saying **Processing...** for 5 seconds. Mouse clicks and keys are swallowed while it is up. In the **Output** section you can turn it off, change the duration (1-60 s) or the text. Another capture during the countdown restarts it. The cover is hidden from screen capture (Windows 10 2004 or later), so it never shows up in a screenshot. It is not a Windows lock: no password is needed, and system keys such as the Windows key and Ctrl+Alt+Del still work. A command-line capture made while the app isn't running (`--direct`, or no service) shows no cover.
 
 ### Taking a screenshot
 
@@ -179,6 +184,7 @@ src/swift_screen_reader/
   launcher.py  SwiftScreenReader.exe entry: --capture, or the tray app
   service.py   resident service: named pipe server and HTTP endpoint
   hotkeys.py   system-wide keyboard shortcuts (RegisterHotKey)
+  overlay.py   "Processing..." screen cover shown after each capture
   selector.py  area selection overlay and area highlight
   gui.py       tray app and window
   updater.py   update check, download and install from GitHub Releases

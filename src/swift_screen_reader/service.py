@@ -22,6 +22,7 @@ UI_COMMANDS = ("show", "select", "quit")
 
 class CaptureService(QObject):
     captured = Signal(str)  # saved file path
+    grabbed = Signal()  # any successful capture, saved or returned over HTTP
     failed = Signal(str)  # error message
     command = Signal(str)  # one of UI_COMMANDS, for the window
 
@@ -86,6 +87,7 @@ class CaptureService(QObject):
             self.failed.emit(str(exc))
             raise
         self.captured.emit(path)
+        self.grabbed.emit()
         return path
 
     def handle(self, message: dict) -> dict:
@@ -176,6 +178,7 @@ class _HttpHandler(BaseHTTPRequestHandler):
             except CaptureError as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
                 return
+            service.grabbed.emit()
             self._send(200, "image/png", data)
         else:
             self._send_json(404, {"ok": False, "error": "Not found"})
