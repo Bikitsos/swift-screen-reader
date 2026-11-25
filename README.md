@@ -1,6 +1,8 @@
 # Swift Screen Reader
 
-A Windows tool that saves a **screenshot of a preselected screen area** every time it is called. It stays resident in the system tray as a small service, so a call returns the saved file in a fraction of a second, from the command line, from another program, or over a local HTTP endpoint.
+A Windows tool for a point of sale: when called, it takes a **screenshot of a preselected screen area** (for example the POS subtotal), **reads the amount with OCR** and **takes the card payment** for it, showing a full-screen payment screen until the operator taps to continue. It stays resident in the system tray, so it reacts in a fraction of a second to a keyboard shortcut, the command line, another program or a local HTTP call.
+
+The card terminal is simulated for now (every payment is approved); a real terminal will plug in when its API is available.
 
 Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https://docs.astral.sh/uv/).
 
@@ -17,7 +19,10 @@ Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https
 - PNG output to a folder of your choice, with a file name pattern (`{timestamp}`, `{date}`, `{time}`) or a fixed name such as `latest.png` that is overwritten on each capture
 - Files are written atomically, so a program watching the folder never reads a half-written image
 - Optional copy to the clipboard and tray notification after each capture
-- After each capture, the screen is covered with a "Processing..." message for 5 seconds that blocks the mouse and keyboard (on by default; duration and text configurable)
+- Reads the amount after a label (default `Subtotal`) with the OCR engine built into Windows: no extra software, about 30 ms
+- Full-screen payment screen: "Processing payment..." then "Transaction successful", held until the operator taps anywhere; other captures are refused meanwhile, so nothing is charged twice
+- A `.json` file next to each screenshot with the text read, the amount and the payment result
+- Detailed activity log (`logs\activity.log`, one file per day, kept 90 days) of every capture, OCR result, payment step and setting change
 - "Show area" briefly outlines the current capture area on screen
 - In-app updates from GitHub Releases
 
@@ -45,10 +50,11 @@ uv run screen-reader-gui --minimized  # start hidden in the tray (what Windows s
 uv run screen-reader-gui --select     # start by selecting the capture area
 ```
 
-- **First run:** click **Select area...**, drag over the part of the screen to capture, release. Esc or right-click cancels. The dashed outline shows the previous area.
+- **First run:** on the **Home** page click **Select area...**, drag over the amount on the POS screen (include the `Subtotal` label), release. Esc or right-click cancels. The dashed outline shows the previous area. Then use **Payment → Test: read the amount now** to check that the amount is read correctly.
+- **Window:** a sidebar with **Home** (status, Capture now, last transaction), **Capture** (area and screenshot folder), **Payment** (OCR and card terminal), **Shortcuts**, **Service** (HTTP endpoint, updates) and **Activity log**. Changes are saved immediately.
 - **Tray icon:** blue means the service is running. Click it to open the window; right-click for Capture now, Select area..., Show area, Open screenshots folder, About and Quit.
 - Closing the window keeps the service running in the tray. Only one copy runs per user; starting it again just opens the running window.
-- You can also type the area (X, Y, width, height in physical pixels) directly in the window.
+- You can also type the area (X, Y, width, height in physical pixels) on the **Capture** page.
 
 Settings are saved to `%APPDATA%\Swift Screen Reader\settings.json`.
 
@@ -61,9 +67,61 @@ Settings are saved to `%APPDATA%\Swift Screen Reader\settings.json`.
 
 They are system-wide: they work in any program while the app runs, even hidden in the tray. To change one, click its box in the window and press the new keys; the **×** turns it off and **Default** restores it. A shortcut needs Ctrl, Alt or Win plus a letter, digit, F-key or navigation key; F1-F24, Print and Pause also work on their own. If another program already uses a combination, the window shows it in red and you can pick a different one. The tray menu lists the active shortcuts.
 
-### Processing screen
+### Payment flow
 
-After every capture made through the running app (shortcut, **Capture now**, the command line or HTTP), every monitor is covered with a dark screen saying **Processing...** for 5 seconds. Mouse clicks and keys are swallowed while it is up. In the **Output** section you can turn it off, change the duration (1-60 s) or the text. Another capture during the countdown restarts it. The cover is hidden from screen capture (Windows 10 2004 or later), so it never shows up in a screenshot. It is not a Windows lock: no password is needed, and system keys such as the Windows key and Ctrl+Alt+Del still work. A command-line capture made while the app isn't running (`--direct`, or no service) shows no cover.
+Every capture made through the running app (shortcut, **Capture now**, the command line or HTTP `/capture`) runs a transaction:
+
+1. The screenshot is saved.
+2. All monitors are covered with a dark screen: **Reading amount...**, then **Processing payment...** with the amount and a spinner. Mouse clicks and keys are swallowed.
+3. The amount is read with Windows OCR: the number after the label (default `Subtotal`) on the same line or the next one. `12.50`, `1,234.56`, `1.234,56`, `€ 12,50` are all understood.
+4. The amount is sent to the card terminal. For now this is a simulator that approves every payment after a short delay (default 2 s).
+5. The result stays on screen until the operator **taps anywhere** (or presses a key):
+   - **Transaction successful** (green) with the amount
+   - **Transaction declined / failed** (red), for when a real terminal is connected
+   - **Nothing to pay** (orange) when the amount is 0.00; nothing is charged
+   - **Could not read the amount** (orange) with the text that was read; nothing is charged
+
+Until the result is tapped away, new captures are refused (the shortcut is ignored, the command line gets an error, HTTP returns 409), so a double press never charges twice. The payment screen is hidden from screen capture (Windows 10 2004 or later). It is not a Windows lock: no password is needed, and system keys such as the Windows key and Ctrl+Alt+Del still work.
+
+On the **Payment** page you can change the label, test the OCR on the current screen, choose the terminal and currency, set the simulated processing time, or turn the payment (or the OCR) off. With payment off, the amount is only read and recorded, without the payment screen. A command-line capture made while the app isn't running (`--direct`, or no service) only saves the screenshot.
+
+### Transaction records
+
+Next to each screenshot a `.json` file with the same name records the transaction:
+
+```json
+{
+  "id": "screenshot_20261125_130241_274",
+  "status": "approved",
+  "message": "Transaction successful",
+  "source": "shortcut",
+  "image": "C:\\...\\screenshot_20261125_130241_274.png",
+  "area": "200,200,400,80",
+  "started": "2026-11-25T13:02:41.276",
+  "finished": "2026-11-25T13:02:43.450",
+  "dismissed": "2026-11-25T13:02:45.643",
+  "ocr": {"label": "Subtotal", "lines": ["Subtotal", "12.50"], "amount_text": "12.50", "ms": 28},
+  "amount": "12.50",
+  "currency": "EUR",
+  "payment": {"requested": true, "terminal": "Simulated terminal (always approves)", "auth_code": "809778",
+              "terminal_reference": "SIM-screenshot_20261125_130241_274", "ms": 2000}
+}
+```
+
+`status` is one of `approved`, `declined`, `error`, `zero` (nothing to pay), `no_amount` (OCR found no amount) or `read` (payment turned off).
+
+### Activity log
+
+Everything the app does is written to `logs\activity.log` next to the exe (or `%LOCALAPPDATA%\Swift Screen Reader\logs` if that folder isn't writable), with millisecond timestamps: start-up, shortcut presses, captures with their source and area, the OCR text and amount, payment requests and results with auth codes, when the operator closed the result screen, refused captures, area selections and every setting change. A new file is started each day and 90 days are kept. The **Activity log** page shows it live and opens the file or folder.
+
+```
+13:02:41.276 INFO Screenshot saved (source: cli, area: 200,200,400,80): C:\...\screenshot_20261125_130241_274.png
+13:02:41.449 INFO TX screenshot_20261125_130241_274: OCR read 'Subtotal | 12.50' in 129 ms
+13:02:41.449 INFO TX screenshot_20261125_130241_274: payment request EUR 12.50 sent to Simulated terminal (always approves)
+13:02:41.460 WARNING Capture from cli refused: a transaction is in progress
+13:02:43.450 INFO TX screenshot_20261125_130241_274: payment APPROVED in 2000 ms (auth code 809778, ...): Transaction successful
+13:02:45.643 INFO TX screenshot_20261125_130241_274: result screen closed by the operator after 2.2 s
+```
 
 ### Taking a screenshot
 
@@ -132,7 +190,7 @@ If [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed (`winget insta
 - starts the service with Windows, minimized to the tray (on by default)
 - registers an uninstaller under **Settings → Apps** and in the Start Menu
 
-Uninstalling closes the app and removes its files, shortcuts, startup entry and saved settings. Screenshots are kept.
+Uninstalling closes the app and removes its files, shortcuts, startup entry and saved settings. Screenshots, transaction records and logs are kept.
 
 To build only the exes by hand:
 
@@ -184,7 +242,10 @@ src/swift_screen_reader/
   launcher.py  SwiftScreenReader.exe entry: --capture, or the tray app
   service.py   resident service: named pipe server and HTTP endpoint
   hotkeys.py   system-wide keyboard shortcuts (RegisterHotKey)
-  overlay.py   "Processing..." screen cover shown after each capture
+  overlay.py   full-screen payment screens (processing, result)
+  ocr.py       Windows OCR and finding the amount after the label
+  payment.py   card terminal interface and the simulator
+  transaction.py  capture -> OCR -> payment run, logging and .json records
   selector.py  area selection overlay and area highlight
   gui.py       tray app and window
   updater.py   update check, download and install from GitHub Releases

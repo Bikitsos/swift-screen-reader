@@ -5,6 +5,11 @@ description = "Windows tray service that saves a screenshot of a preselected scr
 requires-python = ">=3.10"
 dependencies = [
     "PySide6-Essentials>=6.6",
+    "winrt-windows-foundation>=3",
+    "winrt-windows-globalization>=3",
+    "winrt-windows-graphics-imaging>=3",
+    "winrt-windows-media-ocr>=3",
+    "winrt-windows-storage-streams>=3",
 ]
 
 [project.scripts]

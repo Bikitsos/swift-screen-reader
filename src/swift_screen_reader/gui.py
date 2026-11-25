@@ -1,4 +1,4 @@
-"""System tray app: keeps the capture service resident so screenshots are taken instantly when called."""
+"""System tray app: keeps the capture service resident; each capture reads the amount and takes the payment."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ import argparse
 import logging
 import signal
 import sys
+import threading
+from dataclasses import asdict
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
@@ -13,14 +16,17 @@ from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon,
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -29,29 +35,67 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
-from . import APP_NAME, CLI_EXE_NAME, COMPANY, CREDITS, EXE_NAME, __version__, build_info, config, ipc, pipe_name
-from .config import DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, DEFAULT_PROCESSING_TEXT, Area
+from . import APP_NAME, CLI_EXE_NAME, COMPANY, CREDITS, EXE_NAME, __version__, build_info, config, default_logs_dir, ipc, pipe_name
+from .capture import CaptureError, capture_png
+from .config import DEFAULT_AMOUNT_LABEL, DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, Area
 from .hotkeys import HotkeyManager, display
-from .overlay import ProcessingOverlay
+from .ocr import OcrError, recognize
+from .ocr import warm_up as ocr_warm_up
+from .overlay import FAILURE, SUCCESS, WARNING, PaymentScreen
+from .payment import APPROVED, DECLINED, ERROR, TERMINALS
 from .selector import AreaHighlight, AreaSelector
-from .service import CaptureService
+from .service import BusyError, CaptureService
+from .transaction import NO_AMOUNT, PAYING, READ, ZERO, Transaction, TransactionRunner, format_amount
 from .updater import Release, UpdateChecker, UpdateDownloader, can_self_update, is_newer, run_installer
 
 COORD_LIMIT = 100_000
 CAPTURE, SELECT = "Capture now", "Select area"
 PORTABLE = QKeySequence.SequenceFormat.PortableText
+LOG_NAME = "activity.log"
+
+STATUS_COLORS = {
+    APPROVED: "#2e7d32", DECLINED: "#c62828", ERROR: "#c62828", NO_AMOUNT: "#ef6c00", ZERO: "#ef6c00", READ: "#1565c0",
+}
+STATUS_TEXT = {
+    APPROVED: "Approved", DECLINED: "Declined", ERROR: "Failed", NO_AMOUNT: "Amount not read", ZERO: "Nothing to pay",
+    READ: "Amount read (payment off)", PAYING: "Processing payment...",
+}
+
+STYLE = """
+#nav { border: none; background: palette(alternate-base); font-size: 11pt; padding: 6px; outline: 0; }
+#nav::item { padding: 9px 14px; border-radius: 4px; }
+#nav::item:selected { background: palette(highlight); color: palette(highlighted-text); }
+#pageTitle { font-size: 16pt; font-weight: bold; }
+#statusTitle { font-size: 18pt; font-weight: bold; }
+#amount { font-size: 20pt; font-weight: bold; }
+QPushButton#primary { background: #1e88e5; color: white; font-weight: bold; font-size: 11pt;
+                      padding: 10px 26px; border: none; border-radius: 4px; }
+QPushButton#primary:hover { background: #1976d2; }
+QPushButton#primary:pressed { background: #1565c0; }
+QPushButton#big { font-size: 11pt; padding: 9px 18px; }
+"""
 
 
 def _hint(text: str) -> QLabel:
     label = QLabel(text)
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    label.setStyleSheet("color: #777;")
+    label.setStyleSheet("color: #888;")
     return label
+
+
+def _row(*widgets, stretch: bool = True) -> QHBoxLayout:
+    row = QHBoxLayout()
+    for widget in widgets:
+        row.addWidget(widget)
+    if stretch:
+        row.addStretch(1)
+    return row
 
 
 def make_icon(active: bool) -> QIcon:
@@ -87,15 +131,38 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(self.format(record))
 
 
+def setup_file_logging() -> Path | None:
+    """Detailed activity log in <app>/logs/activity.log, a new file each day, kept for 90 days."""
+    folder = default_logs_dir()
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        handler = TimedRotatingFileHandler(folder / LOG_NAME, when="midnight", backupCount=90, encoding="utf-8")
+    except OSError as exc:
+        logging.warning("Could not open the log file in %s: %s", folder, exc)
+        return None
+    handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(handler)
+    return folder / LOG_NAME
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, log_emitter: LogEmitter) -> None:
+    def __init__(self, log_emitter: LogEmitter, log_file: Path | None = None) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(760, 690)
+        self.resize(900, 640)
+        self.log_file = log_file
         self.settings = config.load()
+        self._saved = asdict(self.settings)
         self.service = CaptureService(self.settings, self)
         self.hotkeys = HotkeyManager(self)
         self.hotkeys.triggered.connect(self._on_hotkey)
+        self.runner = TransactionRunner(self)
+        self.runner.changed.connect(self._on_tx_changed)
+        self.runner.finished.connect(self._on_tx_finished)
+        self.screen_cover = PaymentScreen(self)
+        self.screen_cover.dismissed.connect(self._on_result_dismissed)
+        self.current_tx: Transaction | None = None
+        self.last_tx: Transaction | None = None
         self.last_path: str | None = None
         self._selector: AreaSelector | None = None
         self._service_started = False
@@ -112,15 +179,16 @@ class MainWindow(QMainWindow):
         self._http_timer = QTimer(self, singleShot=True, interval=800)
         self._http_timer.timeout.connect(self._restart_http)
 
+        self.setStyleSheet(STYLE)
         self._build_ui()
         self._build_tray()
         self._load_settings()
         log_emitter.message.connect(self.log_view.appendPlainText)
-        logging.info("%s %s (%s)", APP_NAME, __version__, build_info()[0])
+        logging.info("%s %s (%s) started", APP_NAME, __version__, build_info()[0])
+        if self.log_file:
+            logging.info("Activity log: %s", self.log_file)
 
         self.service.captured.connect(self._on_captured)
-        self.service.grabbed.connect(self._on_grabbed)
-        self.processing = ProcessingOverlay(self)
         self.service.failed.connect(self._on_failed)
         self.service.command.connect(self._on_command)
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
@@ -129,17 +197,119 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
-        file_menu.addAction("Capture now", self.capture_now, "Ctrl+Shift+S")
+        file_menu.addAction("Capture now", lambda: self.capture_now("menu"), "Ctrl+Shift+S")
         file_menu.addAction("Select area...", self.select_area)
         file_menu.addAction("Open screenshots folder", self.open_folder)
+        file_menu.addAction("Open activity log", self.open_log)
         file_menu.addSeparator()
         file_menu.addAction("Quit", self.quit)
         help_menu = self.menuBar().addMenu("&Help")
         help_menu.addAction("Check for updates...", lambda: self.check_for_updates(silent=False))
         help_menu.addAction("About", self.show_about)
 
+        self.nav = QListWidget()
+        self.nav.setObjectName("nav")
+        self.nav.setFixedWidth(180)
+        self.pages = QStackedWidget()
+        for name, page in (
+            ("Home", self._build_home_page()),
+            ("Capture", self._build_capture_page()),
+            ("Payment", self._build_payment_page()),
+            ("Shortcuts", self._build_shortcuts_page()),
+            ("Service", self._build_service_page()),
+            ("Activity log", self._build_log_page()),
+        ):
+            self.nav.addItem(name)
+            self.pages.addWidget(page)
+        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.nav.setCurrentRow(0)
+
         central = QWidget()
-        layout = QVBoxLayout(central)
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.nav)
+        layout.addWidget(self.pages, 1)
+        self.setCentralWidget(central)
+        self.statusBar().showMessage(CREDITS)
+
+    def _page(self, title: str, subtitle: str = "") -> tuple[QScrollArea, QVBoxLayout]:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 18, 24, 18)
+        heading = QLabel(title)
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
+        if subtitle:
+            layout.addWidget(_hint(subtitle))
+        layout.addSpacing(6)
+        # Scroll instead of squashing the controls on small or highly scaled screens.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        return scroll, layout
+
+    def _build_home_page(self) -> QWidget:
+        page, layout = self._page("Home")
+        self.status_title = QLabel()
+        self.status_title.setObjectName("statusTitle")
+        self.status_detail = QLabel()
+        self.status_detail.setStyleSheet("font-size: 11pt;")
+        layout.addWidget(self.status_title)
+        layout.addWidget(self.status_detail)
+        layout.addSpacing(10)
+
+        capture = QPushButton("Capture now")
+        capture.setObjectName("primary")
+        capture.clicked.connect(lambda: self.capture_now("button"))
+        select = QPushButton("Select area...")
+        select.setObjectName("big")
+        select.clicked.connect(self.select_area)
+        show = QPushButton("Show area")
+        show.setObjectName("big")
+        show.clicked.connect(self.show_area)
+        layout.addLayout(_row(capture, select, show))
+        layout.addSpacing(14)
+
+        box = QGroupBox("Last transaction")
+        grid = QGridLayout(box)
+        grid.setColumnStretch(1, 1)
+        self.tx_amount = QLabel("-")
+        self.tx_amount.setObjectName("amount")
+        self.tx_status = QLabel("No transaction yet")
+        self.tx_status.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        self.tx_time = QLabel("-")
+        self.tx_source = QLabel("-")
+        self.tx_read = QLabel("-")
+        self.tx_message = QLabel("-")
+        self.tx_auth = QLabel("-")
+        for label in (self.tx_read, self.tx_message, self.tx_time, self.tx_auth):
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setWordWrap(True)
+        rows = (("Amount", self.tx_amount), ("Status", self.tx_status), ("Time", self.tx_time),
+                ("Source", self.tx_source), ("Read by OCR", self.tx_read), ("Details", self.tx_message),
+                ("Auth code", self.tx_auth))
+        for row, (name, widget) in enumerate(rows):
+            caption = QLabel(name + ":")
+            caption.setStyleSheet("color: #888;")
+            grid.addWidget(caption, row, 0, Qt.AlignmentFlag.AlignTop)
+            grid.addWidget(widget, row, 1)
+        self.open_last_button = QPushButton("Open screenshot")
+        self.open_last_button.clicked.connect(self.open_last)
+        self.open_json_button = QPushButton("Open details (.json)")
+        self.open_json_button.clicked.connect(self.open_last_json)
+        folder = QPushButton("Screenshots folder")
+        folder.clicked.connect(self.open_folder)
+        grid.addLayout(_row(self.open_last_button, self.open_json_button, folder), len(rows), 0, 1, 2)
+        self.open_last_button.setEnabled(False)
+        self.open_json_button.setEnabled(False)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
+
+    def _build_capture_page(self) -> QWidget:
+        page, layout = self._page("Capture", "The screen area to capture and where the screenshots are saved.")
 
         area_box = QGroupBox("Capture area (physical pixels)")
         area_layout = QVBoxLayout(area_box)
@@ -155,24 +325,15 @@ class MainWindow(QMainWindow):
             coords.addWidget(QLabel(label))
             coords.addWidget(spin, 1)
         area_layout.addLayout(coords)
-        buttons = QHBoxLayout()
         select = QPushButton("Select area...")
         select.clicked.connect(self.select_area)
         show = QPushButton("Show area")
         show.clicked.connect(self.show_area)
-        capture = QPushButton("Capture now")
-        capture.clicked.connect(self.capture_now)
-        self.open_last_button = QPushButton("Open last screenshot")
-        self.open_last_button.clicked.connect(self.open_last)
-        self.open_last_button.setEnabled(False)
-        for button in (select, show, capture, self.open_last_button):
-            buttons.addWidget(button)
-        area_layout.addLayout(buttons)
+        area_layout.addLayout(_row(select, show))
         layout.addWidget(area_box)
 
-        output_box = QGroupBox("Output")
+        output_box = QGroupBox("Screenshots")
         form = QFormLayout(output_box)
-        folder_row = QHBoxLayout()
         self.folder_edit = QLineEdit()
         self.folder_edit.setPlaceholderText(str(config.Settings().screenshots_dir()))
         self.folder_edit.textChanged.connect(self._schedule_save)
@@ -180,6 +341,7 @@ class MainWindow(QMainWindow):
         browse.clicked.connect(self._browse_folder)
         open_folder = QPushButton("Open")
         open_folder.clicked.connect(self.open_folder)
+        folder_row = QHBoxLayout()
         folder_row.addWidget(self.folder_edit, 1)
         folder_row.addWidget(browse)
         folder_row.addWidget(open_folder)
@@ -189,32 +351,73 @@ class MainWindow(QMainWindow):
         self.name_edit.textChanged.connect(self._schedule_save)
         form.addRow("File name:", self.name_edit)
         form.addRow("", _hint("Placeholders: {timestamp}, {date}, {time}.\n"
-                              "A fixed name such as latest.png is overwritten on every capture."))
+                              "A .json file with the amount and payment result is saved next to each screenshot."))
         self.clipboard_check = QCheckBox("Also copy the screenshot to the clipboard")
         self.clipboard_check.toggled.connect(self._schedule_save)
-        self.notify_check = QCheckBox("Show a notification after each capture")
+        self.notify_check = QCheckBox("Show a tray notification after each capture")
         self.notify_check.toggled.connect(self._schedule_save)
         form.addRow("", self.clipboard_check)
         form.addRow("", self.notify_check)
-        cover_row = QHBoxLayout()
-        self.processing_check = QCheckBox("After each capture, cover the screen for")
-        self.processing_check.toggled.connect(self._schedule_save)
-        self.processing_spin = QSpinBox()
-        self.processing_spin.setRange(1, 60)
-        self.processing_spin.setSuffix(" s")
-        self.processing_spin.valueChanged.connect(self._schedule_save)
-        self.processing_edit = QLineEdit()
-        self.processing_edit.setPlaceholderText(DEFAULT_PROCESSING_TEXT)
-        self.processing_edit.textChanged.connect(self._schedule_save)
-        cover_row.addWidget(self.processing_check)
-        cover_row.addWidget(self.processing_spin)
-        cover_row.addWidget(QLabel("showing"))
-        cover_row.addWidget(self.processing_edit, 1)
-        form.addRow("", cover_row)
         layout.addWidget(output_box)
+        layout.addStretch(1)
+        return page
 
-        keys_box = QGroupBox("Keyboard shortcuts (work anywhere, also while the app is in the tray)")
-        keys_form = QFormLayout(keys_box)
+    def _build_payment_page(self) -> QWidget:
+        page, layout = self._page("Payment", "After each capture the amount is read from the screenshot and sent "
+                                             "to the card terminal.")
+
+        ocr_box = QGroupBox("Read the amount (OCR)")
+        form = QFormLayout(ocr_box)
+        self.ocr_check = QCheckBox("Read the amount from each screenshot")
+        self.ocr_check.toggled.connect(self._schedule_save)
+        form.addRow("", self.ocr_check)
+        self.label_edit = QLineEdit()
+        self.label_edit.setPlaceholderText(DEFAULT_AMOUNT_LABEL)
+        self.label_edit.setMaximumWidth(260)
+        self.label_edit.textChanged.connect(self._schedule_save)
+        form.addRow("Text before the amount:", self.label_edit)
+        form.addRow("", _hint("The amount is the number after this text, on the same line or the next one."))
+        test = QPushButton("Test: read the amount now")
+        test.clicked.connect(self.test_ocr)
+        self.ocr_result = QLabel()
+        self.ocr_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ocr_result.setWordWrap(True)
+        form.addRow("", _row(test))
+        form.addRow("", self.ocr_result)
+        layout.addWidget(ocr_box)
+
+        pay_box = QGroupBox("Card terminal")
+        pay_form = QFormLayout(pay_box)
+        self.payment_check = QCheckBox("Charge the amount and show the payment screen")
+        self.payment_check.toggled.connect(self._schedule_save)
+        pay_form.addRow("", self.payment_check)
+        self.terminal_combo = QComboBox()
+        for key, name in TERMINALS.items():
+            self.terminal_combo.addItem(name, key)
+        self.terminal_combo.currentIndexChanged.connect(self._schedule_save)
+        pay_form.addRow("Terminal:", _row(self.terminal_combo))
+        self.currency_edit = QLineEdit()
+        self.currency_edit.setMaxLength(3)
+        self.currency_edit.setMaximumWidth(70)
+        self.currency_edit.setPlaceholderText("EUR")
+        self.currency_edit.textChanged.connect(self._schedule_save)
+        pay_form.addRow("Currency:", _row(self.currency_edit))
+        self.sim_spin = QSpinBox()
+        self.sim_spin.setRange(0, 30)
+        self.sim_spin.setSuffix(" s")
+        self.sim_spin.valueChanged.connect(self._schedule_save)
+        pay_form.addRow("Simulated processing time:", _row(self.sim_spin))
+        pay_form.addRow("", _hint("Shows \u201cProcessing payment...\u201d, then the result until the operator taps.\n"
+                                  "Other captures are refused until then, so nothing is charged twice.\n"
+                                  "Real terminals will be added here."))
+        layout.addWidget(pay_box)
+        layout.addStretch(1)
+        return page
+
+    def _build_shortcuts_page(self) -> QWidget:
+        page, layout = self._page("Shortcuts", "Work anywhere in Windows, also while the app is hidden in the tray.")
+        box = QGroupBox("Keyboard shortcuts")
+        form = QFormLayout(box)
         self.hotkey_edits: dict[str, QKeySequenceEdit] = {}
         for name, default in ((CAPTURE, DEFAULT_HOTKEY_CAPTURE), (SELECT, DEFAULT_HOTKEY_SELECT)):
             edit = QKeySequenceEdit()
@@ -227,50 +430,56 @@ class MainWindow(QMainWindow):
             row = QHBoxLayout()
             row.addWidget(edit, 1)
             row.addWidget(reset)
-            keys_form.addRow(f"{name}:", row)
+            form.addRow(f"{name}:", row)
             self.hotkey_edits[name] = edit
         self.hotkey_status = QLabel()
-        keys_form.addRow("", self.hotkey_status)
-        layout.addWidget(keys_box)
-        service_box = QGroupBox("Service")
-        service_form = QFormLayout(service_box)
-        self.status_label = QLabel()
-        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        service_form.addRow("Status:", self.status_label)
-        http_row = QHBoxLayout()
+        form.addRow("", self.hotkey_status)
+        form.addRow("", _hint("Click a box and press the new keys; clear it to turn the shortcut off.\n"
+                              "Use Ctrl, Alt or Win with a letter, digit or F-key. F1-F24, Print and Pause also work "
+                              "alone."))
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
+
+    def _build_service_page(self) -> QWidget:
+        page, layout = self._page("Service", "How other programs call the app.")
+        box = QGroupBox("Background service")
+        form = QFormLayout(box)
+        self.service_label = QLabel()
+        self.service_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("Status:", self.service_label)
         self.http_check = QCheckBox("Local HTTP endpoint on 127.0.0.1, port")
         self.http_check.toggled.connect(self._on_http_changed)
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1024, 65535)
         self.port_spin.valueChanged.connect(self._on_http_changed)
-        http_row.addWidget(self.http_check)
-        http_row.addWidget(self.port_spin)
-        http_row.addStretch(1)
-        service_form.addRow("", http_row)
+        form.addRow("", _row(self.http_check, self.port_spin))
         self.update_check = QCheckBox("Check for updates at startup")
         self.update_check.toggled.connect(self._schedule_save)
-        service_form.addRow("", self.update_check)
-        service_form.addRow("", _hint(
-            f"Call it with the shortcuts above, {CLI_EXE_NAME}.exe (prints the saved path),\n"
+        form.addRow("", self.update_check)
+        form.addRow("", _hint(
+            f"Call it with the keyboard shortcuts, {CLI_EXE_NAME}.exe (prints the saved path),\n"
             f"{EXE_NAME}.exe --capture, or GET http://127.0.0.1:<port>/capture or /capture.png."
         ))
-        layout.addWidget(service_box)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
 
-        layout.addWidget(QLabel("Activity"))
+    def _build_log_page(self) -> QWidget:
+        page, layout = self._page("Activity log", "Every capture, amount read, payment step and setting change.")
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(1000)
-        self.log_view.setMinimumHeight(60)
+        self.log_view.setMaximumBlockCount(5000)
+        self.log_view.setMinimumHeight(300)
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(self.log_view, 1)
-        credits = QLabel(CREDITS)
-        credits.setStyleSheet("color: #777;")
-        layout.addWidget(credits)
-        # Scroll instead of squashing the controls on small or highly scaled screens.
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(central)
-        self.setCentralWidget(scroll)
+        open_file = QPushButton("Open log file")
+        open_file.clicked.connect(self.open_log)
+        open_folder = QPushButton("Open logs folder")
+        open_folder.clicked.connect(lambda: self._open_path(self.log_file.parent if self.log_file else default_logs_dir()))
+        layout.addLayout(_row(open_file, open_folder))
+        layout.addWidget(_hint(f"Saved to {self.log_file or default_logs_dir()}; a new file each day, kept 90 days."))
+        return page
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self._icon_off, self)
@@ -279,7 +488,7 @@ class MainWindow(QMainWindow):
         font = bold.font()
         font.setBold(True)
         bold.setFont(font)
-        bold.triggered.connect(self.capture_now)
+        bold.triggered.connect(lambda: self.capture_now("tray"))
         menu.addAction(bold)
         select = menu.addAction("Select area...", self.select_area)
         self._tray_actions = {CAPTURE: (bold, "Capture now"), SELECT: (select, "Select area...")}
@@ -314,10 +523,14 @@ class MainWindow(QMainWindow):
         self.update_check.setChecked(s.check_updates)
         self.hotkey_edits[CAPTURE].setKeySequence(QKeySequence.fromString(s.hotkey_capture, PORTABLE))
         self.hotkey_edits[SELECT].setKeySequence(QKeySequence.fromString(s.hotkey_select, PORTABLE))
-        self.processing_check.setChecked(s.processing_enabled)
-        self.processing_spin.setValue(s.processing_seconds)
-        self.processing_edit.setText("" if s.processing_text == DEFAULT_PROCESSING_TEXT else s.processing_text)
+        self.ocr_check.setChecked(s.ocr_enabled)
+        self.label_edit.setText("" if s.amount_label == DEFAULT_AMOUNT_LABEL else s.amount_label)
+        self.payment_check.setChecked(s.payment_enabled)
+        self.terminal_combo.setCurrentIndex(max(0, self.terminal_combo.findData(s.terminal)))
+        self.currency_edit.setText(s.currency)
+        self.sim_spin.setValue(s.simulated_seconds)
         self._loading = False
+        self._apply_payment_state()
         self._update_area_label()
 
     def _schedule_save(self) -> None:
@@ -333,16 +546,33 @@ class MainWindow(QMainWindow):
         s.check_updates = self.update_check.isChecked()
         s.hotkey_capture = self.hotkey_edits[CAPTURE].keySequence().toString(PORTABLE)
         s.hotkey_select = self.hotkey_edits[SELECT].keySequence().toString(PORTABLE)
-        s.processing_enabled = self.processing_check.isChecked()
-        s.processing_seconds = self.processing_spin.value()
-        s.processing_text = self.processing_edit.text().strip() or DEFAULT_PROCESSING_TEXT
+        s.ocr_enabled = self.ocr_check.isChecked()
+        s.amount_label = self.label_edit.text().strip() or DEFAULT_AMOUNT_LABEL
+        s.payment_enabled = self.payment_check.isChecked()
+        s.terminal = self.terminal_combo.currentData() or "simulated"
+        s.currency = self.currency_edit.text().strip().upper() or "EUR"
+        s.simulated_seconds = self.sim_spin.value()
+        self._apply_payment_state()
         self._save_timer.start()
 
+    def _apply_payment_state(self) -> None:
+        s = self.settings
+        for widget in (self.payment_check, self.terminal_combo, self.currency_edit, self.sim_spin, self.label_edit):
+            widget.setEnabled(s.ocr_enabled)
+        self.service.hold_after_capture = s.ocr_enabled and s.payment_enabled
+        self._update_home()
+
     def _save_settings(self) -> None:
+        current = asdict(self.settings)
+        changes = [f"{key}={current[key]!r}" for key in current if key != "extra" and current[key] != self._saved.get(key)]
         try:
             config.save(self.settings)
         except OSError as exc:
             logging.error("Could not save settings: %s", exc)
+            return
+        if changes:
+            logging.info("Settings changed: %s", ", ".join(changes))
+        self._saved = current
 
     def _on_area_edited(self) -> None:
         if self._loading:
@@ -369,6 +599,25 @@ class MainWindow(QMainWindow):
             self.area_label.setText(f"{area.width} x {area.height} pixels at ({area.x}, {area.y})")
         else:
             self.area_label.setText("No area selected yet. Click Select area... and drag over the screen.")
+        self._update_home()
+
+    def _update_home(self) -> None:
+        if not hasattr(self, "status_title"):
+            return
+        s = self.settings
+        if self.service.busy:
+            title, color, detail = "Transaction in progress", "#1565c0", "Waiting for the operator to finish on the payment screen."
+        elif s.area is None:
+            title, color, detail = "Select a capture area", "#ef6c00", "Click Select area... and drag over the amount on the POS screen."
+        else:
+            title, color = "Ready", "#2e7d32"
+            action = "capture and take the payment" if s.ocr_enabled and s.payment_enabled else (
+                "capture and read the amount" if s.ocr_enabled else "capture")
+            key = display(s.hotkey_capture) if s.hotkey_capture else ""
+            detail = f"Press {key} anywhere to {action}." if key else f"Click Capture now to {action}."
+        self.status_title.setText(title)
+        self.status_title.setStyleSheet(f"color: {color};")
+        self.status_detail.setText(detail)
 
     def _on_http_changed(self) -> None:
         if self._loading:
@@ -379,6 +628,21 @@ class MainWindow(QMainWindow):
     def _restart_http(self) -> None:
         self.service.restart_http()
         self._update_status()
+
+    def _update_status(self) -> None:
+        parts = [f"Running. Pipe \\\\.\\pipe\\{pipe_name()}"]
+        if self.service.http_running:
+            parts.append(f"HTTP http://127.0.0.1:{self.settings.http_port}/")
+        elif self.service.http_error:
+            parts.append(f"HTTP off: {self.service.http_error}")
+        self.service_label.setText("\n".join(parts))
+        self.tray.setIcon(self._icon_on)
+        self.tray.setToolTip(f"{APP_NAME} {__version__}: ready")
+
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Screenshots folder", str(self.settings.screenshots_dir()))
+        if folder:
+            self.folder_edit.setText(folder)
 
     # -- keyboard shortcuts ---------------------------------------------------
 
@@ -402,44 +666,33 @@ class MainWindow(QMainWindow):
             return
         shortcuts = {CAPTURE: self.settings.hotkey_capture, SELECT: self.settings.hotkey_select}
         errors = self.hotkeys.apply(shortcuts)
-        active = [f"{name}: {display(text)}" for name, text in shortcuts.items() if text and name not in errors]
+        active = [name for name, text in shortcuts.items() if text and name not in errors]
         if errors:
             self.hotkey_status.setStyleSheet("color: #c62828;")
             self.hotkey_status.setText("\n".join(errors.values()))
         elif active:
             self.hotkey_status.setStyleSheet("color: #2e7d32;")
-            self.hotkey_status.setText("Active. Click a box and press new keys to change; clear it to turn it off.")
+            self.hotkey_status.setText("Active.")
         else:
-            self.hotkey_status.setStyleSheet("color: #777;")
+            self.hotkey_status.setStyleSheet("color: #888;")
             self.hotkey_status.setText("No shortcuts set.")
         for name, (action, label) in self._tray_actions.items():
             text = shortcuts[name]
             action.setText(f"{label}\t{display(text)}" if text and name not in errors else label)
+        self._update_home()
 
     def _on_hotkey(self, name: str) -> None:
-        if self._selector is not None:
+        text = self.settings.hotkey_capture if name == CAPTURE else self.settings.hotkey_select
+        logging.info("Shortcut %s pressed: %s", display(text), name)
+        if self._selector is not None or self.screen_cover.visible:
+            logging.info("Shortcut ignored: %s", "area selection is open" if self._selector else "payment screen is showing")
             return
         if name == CAPTURE:
-            self.capture_now()
+            self.capture_now("shortcut")
         elif name == SELECT:
             self.select_area()
 
-    def _update_status(self) -> None:
-        parts = [f"Running. Pipe \\\\.\\pipe\\{pipe_name()}"]
-        if self.service.http_running:
-            parts.append(f"HTTP http://127.0.0.1:{self.settings.http_port}/")
-        elif self.service.http_error:
-            parts.append(f"HTTP off: {self.service.http_error}")
-        self.status_label.setText("\n".join(parts))
-        self.tray.setIcon(self._icon_on)
-        self.tray.setToolTip(f"{APP_NAME} {__version__}: ready")
-
-    def _browse_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Screenshots folder", str(self.settings.screenshots_dir()))
-        if folder:
-            self.folder_edit.setText(folder)
-
-    # -- service --------------------------------------------------------------
+    # -- capture and transactions --------------------------------------------
 
     def start_service(self) -> bool:
         if not self.service.start():
@@ -447,9 +700,11 @@ class MainWindow(QMainWindow):
         self._service_started = True
         self._update_status()
         self.apply_hotkeys()
+        threading.Thread(target=ocr_warm_up, name="ocr-warm-up", daemon=True).start()
         return True
 
     def _on_command(self, cmd: str) -> None:
+        logging.info("Command from the command line: %s", cmd)
         if cmd == "show":
             self.show_window()
         elif cmd == "select":
@@ -457,10 +712,22 @@ class MainWindow(QMainWindow):
         elif cmd == "quit":
             QTimer.singleShot(0, self.quit)
 
-    def _on_captured(self, path: str) -> None:
+    def capture_now(self, source: str = "button") -> None:
+        if self.settings.area is None:
+            logging.info("Capture (%s): no area selected yet, opening the area selection", source)
+            self.select_area()
+            return
+        try:
+            self.service.capture(source=source)
+        except BusyError as exc:
+            self.statusBar().showMessage(str(exc), 4000)
+        except (CaptureError, OSError):
+            pass  # already logged through the failed signal
+
+    def _on_captured(self, path: str, source: str, area: str) -> None:
         self.last_path = path
         self.open_last_button.setEnabled(True)
-        logging.info("Saved %s", path)
+        logging.info("Screenshot saved (source: %s, area: %s): %s", source, area, path)
         if self.settings.copy_to_clipboard:
             image = QImage(path)
             if not image.isNull():
@@ -468,31 +735,98 @@ class MainWindow(QMainWindow):
         if self.settings.notify:
             self._tray_click = self.open_last
             self.tray.showMessage(APP_NAME, f"Saved {Path(path).name}", QSystemTrayIcon.MessageIcon.Information, 2000)
+        if not self.settings.ocr_enabled:
+            self.service.release()
+            return
+        tx = self.runner.start(path, source, area, self.settings)
+        self.current_tx = tx
+        if tx.payment:
+            self.screen_cover.show_processing("Reading amount...")
+            logging.info("TX %s: payment screen shown", tx.id)
+        self._show_tx(tx)
+        self._update_home()
 
-    def _on_grabbed(self) -> None:
-        s = self.settings
-        if s.processing_enabled:
-            self.processing.show(s.processing_text or DEFAULT_PROCESSING_TEXT, s.processing_seconds)
-
-    def _on_failed(self, error: str) -> None:
-        logging.error("Capture failed: %s", error)
+    def _on_failed(self, error: str, source: str) -> None:
+        logging.error("Capture failed (source: %s): %s", source, error)
         if self.settings.notify:
             self.tray.showMessage(APP_NAME, f"Capture failed: {error}", QSystemTrayIcon.MessageIcon.Warning, 4000)
 
-    def capture_now(self) -> None:
-        if self.settings.area is None:
-            self.select_area()
+    def _on_tx_changed(self, tx: Transaction) -> None:
+        if tx.status == PAYING and tx.payment and self.screen_cover.visible:
+            self.screen_cover.show_processing("Processing payment...", tx.amount_display)
+        self._show_tx(tx)
+
+    def _on_tx_finished(self, tx: Transaction) -> None:
+        self.last_tx = tx
+        self._show_tx(tx)
+        if not (tx.payment and self.screen_cover.visible):
+            self._end_transaction(tx)
             return
+        if tx.status == APPROVED:
+            self.screen_cover.show_result(SUCCESS, "Transaction successful", tx.amount_display)
+        elif tx.status in (DECLINED, ERROR):
+            self.screen_cover.show_result(FAILURE, "Transaction declined" if tx.status == DECLINED else "Transaction failed",
+                                          tx.message)
+        elif tx.status == ZERO:
+            self.screen_cover.show_result(WARNING, "Nothing to pay", tx.message)
+        else:
+            self.screen_cover.show_result(WARNING, "Could not read the amount", tx.message)
+        logging.info("TX %s: result screen shown (%s)", tx.id, STATUS_TEXT.get(tx.status, tx.status))
+
+    def _on_result_dismissed(self) -> None:
+        tx = self.current_tx
+        if tx is not None:
+            self.runner.dismiss(tx)
+            self._end_transaction(tx)
+
+    def _end_transaction(self, tx: Transaction) -> None:
+        if self.current_tx is tx:
+            self.current_tx = None
+        self.service.release()
+        self._update_home()
+        if self.settings.notify and tx.status in STATUS_TEXT:
+            self.tray.showMessage(APP_NAME, f"{STATUS_TEXT[tx.status]}: {tx.amount_display}",
+                                  QSystemTrayIcon.MessageIcon.Information, 3000)
+
+    def _show_tx(self, tx: Transaction) -> None:
+        self.tx_amount.setText(tx.amount_display if tx.amount is not None else "-")
+        status = STATUS_TEXT.get(tx.status, "Reading amount..." if not tx.done else tx.status)
+        self.tx_status.setText(status)
+        self.tx_status.setStyleSheet(f"font-size: 12pt; font-weight: bold; color: {STATUS_COLORS.get(tx.status, '#1565c0')};")
+        self.tx_time.setText(tx.started.strftime("%Y-%m-%d %H:%M:%S"))
+        self.tx_source.setText(tx.source)
+        self.tx_read.setText(" | ".join(tx.ocr_lines) if tx.ocr_lines else "-")
+        self.tx_message.setText(tx.message or "-")
+        self.tx_auth.setText(tx.auth_code or "-")
+        self.open_json_button.setEnabled(tx.done)
+
+    def test_ocr(self) -> None:
+        area = self.settings.area
+        if area is None:
+            self.ocr_result.setText("Select a capture area first.")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.service.capture()
-        except Exception:  # noqa: BLE001 - already logged through the failed signal
-            pass
+            result = recognize(QImage.fromData(capture_png(area)), self.settings.amount_label)
+        except (CaptureError, OcrError) as exc:
+            self.ocr_result.setStyleSheet("color: #c62828;")
+            self.ocr_result.setText(str(exc))
+            logging.warning("OCR test failed: %s", exc)
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        amount = format_amount(result.amount, self.settings.currency) if result.amount is not None else "not found"
+        ok = result.amount is not None
+        self.ocr_result.setStyleSheet(f"color: {'#2e7d32' if ok else '#c62828'};")
+        self.ocr_result.setText(f"Amount: {amount}\nRead: {result.text or '(no text)'}  ({result.ms} ms)")
+        logging.info("OCR test: read %r, amount %s (%d ms)", result.text, amount, result.ms)
 
     def select_area(self) -> None:
         if self._selector is not None:
             return
         was_visible = self.isVisible()
         self.hide()
+        logging.info("Area selection opened")
 
         def done(area: Area | None) -> None:
             self._selector = None
@@ -500,6 +834,8 @@ class MainWindow(QMainWindow):
                 self._set_area(area)
                 logging.info("Capture area set to %s", area)
                 self.show_area()
+            else:
+                logging.info("Area selection cancelled")
             if was_visible or area is None and self.settings.area is None:
                 self.show_window()
 
@@ -522,14 +858,25 @@ class MainWindow(QMainWindow):
             highlight.deleteLater()
             logging.warning("The capture area %s is not on any connected screen", self.settings.area)
 
+    def _open_path(self, path: str | Path) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     def open_folder(self) -> None:
         folder = self.settings.screenshots_dir()
         folder.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        self._open_path(folder)
 
     def open_last(self) -> None:
         if self.last_path and Path(self.last_path).exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.last_path))
+            self._open_path(self.last_path)
+
+    def open_last_json(self) -> None:
+        if self.last_tx and self.last_tx.json_path.exists():
+            self._open_path(self.last_tx.json_path)
+
+    def open_log(self) -> None:
+        if self.log_file and self.log_file.exists():
+            self._open_path(self.log_file)
 
     # -- updates --------------------------------------------------------------
 
@@ -588,6 +935,9 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl(release.page_url))
 
     def _download_update(self, release: Release) -> None:
+        if self.service.busy:
+            QMessageBox.information(self, "Update", "Finish the current transaction first.")
+            return
         dialog = QProgressDialog(f"Downloading {release.asset_name}...", "Cancel", 0, 100, self)
         dialog.setWindowTitle("Updating")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -631,8 +981,8 @@ class MainWindow(QMainWindow):
         box.setText(
             f"<h3>{APP_NAME}</h3>"
             f"<p>Version {__version__}<br>Build: {build}</p>"
-            "<p>Stays resident in the system tray and saves a screenshot of a preselected "
-            "screen area whenever it is called.</p>"
+            "<p>Captures a preselected screen area when called, reads the amount with OCR "
+            "and takes the card payment.</p>"
             f"<p><b>{CREDITS}</b></p>"
         )
         box.exec()
@@ -659,12 +1009,13 @@ class MainWindow(QMainWindow):
             self.quit()
 
     def quit(self) -> None:
+        logging.info("Quitting")
         if self._save_timer.isActive():
             self._save_timer.stop()
             self._save_settings()
         self.service.stop()
         self.hotkeys.stop()
-        self.processing.hide()
+        self.screen_cover.hide()
         QApplication.instance().focusChanged.disconnect(self._on_focus_changed)
         self.tray.hide()
         QApplication.quit()
@@ -696,8 +1047,9 @@ def main(argv: list[str] | None = None) -> int:
     root = logging.getLogger()
     root.addHandler(handler)
     root.setLevel(logging.INFO)
+    log_file = setup_file_logging()
 
-    window = MainWindow(emitter)
+    window = MainWindow(emitter, log_file)
     if not window.start_service():
         QMessageBox.critical(None, APP_NAME, f"{APP_NAME} is already running or its pipe is in use.")
         return 1

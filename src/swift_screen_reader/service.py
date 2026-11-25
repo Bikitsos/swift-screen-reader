@@ -20,15 +20,22 @@ MAX_REQUEST = 64 * 1024
 UI_COMMANDS = ("show", "select", "quit")
 
 
+class BusyError(CaptureError):
+    pass
+
+
 class CaptureService(QObject):
-    captured = Signal(str)  # saved file path
-    grabbed = Signal()  # any successful capture, saved or returned over HTTP
-    failed = Signal(str)  # error message
+    captured = Signal(str, str, str)  # saved file path, source (shortcut, cli, http, ...), area
+    failed = Signal(str, str)  # error message, source
     command = Signal(str)  # one of UI_COMMANDS, for the window
 
     def __init__(self, settings: Settings, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
+        # When set, each saved capture starts a transaction and further captures are refused until release().
+        self.hold_after_capture = False
+        self._busy = False
+        self._busy_lock = threading.Lock()
         self._server = QLocalServer(self)
         self._server.newConnection.connect(self._on_new_connection)
         self._buffers: dict[QLocalSocket, bytes] = {}
@@ -80,20 +87,35 @@ class CaptureService(QObject):
 
     # -- commands -------------------------------------------------------------
 
-    def capture(self, area: Area | None = None, output: str | None = None) -> str:
-        try:
-            path = str(take_screenshot(self.settings, area, output))
-        except (CaptureError, OSError) as exc:
-            self.failed.emit(str(exc))
-            raise
-        self.captured.emit(path)
-        self.grabbed.emit()
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def release(self) -> None:
+        """Allow captures again after a transaction has finished."""
+        self._busy = False
+
+    def capture(self, area: Area | None = None, output: str | None = None, source: str = "app") -> str:
+        """Save a screenshot; raises BusyError while a transaction is in progress (avoids double charges)."""
+        with self._busy_lock:
+            if self._busy:
+                logging.warning("Capture from %s refused: a transaction is in progress", source)
+                raise BusyError("A transaction is in progress. Try again when it has finished.")
+            area = area or self.settings.area
+            try:
+                path = str(take_screenshot(self.settings, area, output))
+            except (CaptureError, OSError) as exc:
+                self.failed.emit(str(exc), source)
+                raise
+            if self.hold_after_capture:
+                self._busy = True
+        self.captured.emit(path, source, str(area))
         return path
 
     def handle(self, message: dict) -> dict:
         cmd = message.get("cmd", "capture")
         if cmd == "ping":
-            return {"ok": True, "version": __version__, "pid": os.getpid()}
+            return {"ok": True, "version": __version__, "pid": os.getpid(), "busy": self._busy}
         if cmd in UI_COMMANDS:
             self.command.emit(cmd)
             return {"ok": True}
@@ -101,7 +123,7 @@ class CaptureService(QObject):
             return {"ok": False, "error": f"Unknown command {cmd!r}"}
         try:
             area = Area.parse(message["area"]) if message.get("area") else None
-            return {"ok": True, "path": self.capture(area, message.get("output") or None)}
+            return {"ok": True, "path": self.capture(area, message.get("output") or None, "cli")}
         except (ValueError, CaptureError, OSError) as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -162,10 +184,13 @@ class _HttpHandler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "area": str(settings.area) if settings.area else None,
                 "folder": str(settings.screenshots_dir()),
+                "busy": service.busy,
             })
         elif url.path == "/capture":
             try:
-                self._send_json(200, {"ok": True, "path": service.capture(area)})
+                self._send_json(200, {"ok": True, "path": service.capture(area, source="http")})
+            except BusyError as exc:
+                self._send_json(409, {"ok": False, "error": str(exc)})
             except (CaptureError, OSError) as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
         elif url.path == "/capture.png":
@@ -178,7 +203,6 @@ class _HttpHandler(BaseHTTPRequestHandler):
             except CaptureError as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
                 return
-            service.grabbed.emit()
             self._send(200, "image/png", data)
         else:
             self._send_json(404, {"ok": False, "error": "Not found"})

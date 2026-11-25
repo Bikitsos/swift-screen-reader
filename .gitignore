@@ -6,6 +6,7 @@ __pycache__/
 
 # App output
 screenshots/
+logs/
 
 # Build output (PyInstaller, Inno Setup); screen-reader.spec is tracked on purpose
 build/

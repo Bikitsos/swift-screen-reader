@@ -42,8 +42,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "startup"; Description: "Start the capture service automatically with Windows (in the system tray)"; GroupDescription: "Startup:"
 
 [Dirs]
-; Screenshots live next to the exe; let normal users write there even under Program Files. Kept on uninstall.
+; Screenshots and logs live next to the exe; let normal users write there even under Program Files. Kept on uninstall.
 Name: "{app}\screenshots"; Permissions: users-modify; Flags: uninsneveruninstall
+Name: "{app}\logs"; Permissions: users-modify; Flags: uninsneveruninstall
 
 [InstallDelete]
 ; Drop files from the previous version before copying the new ones.

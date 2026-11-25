@@ -41,8 +41,16 @@ def data_dir() -> Path:
 
 
 def default_screenshots_dir() -> Path:
-    """`<app root>/screenshots`, or a per-user folder if the app root is not writable."""
-    preferred = app_root() / "screenshots"
+    return writable_app_dir("screenshots")
+
+
+def default_logs_dir() -> Path:
+    return writable_app_dir("logs")
+
+
+def writable_app_dir(name: str) -> Path:
+    """`<app root>/<name>`, or a per-user folder if the app root is not writable."""
+    preferred = app_root() / name
     try:
         preferred.mkdir(parents=True, exist_ok=True)
         probe = preferred / ".write_test"
@@ -51,7 +59,7 @@ def default_screenshots_dir() -> Path:
         return preferred
     except OSError:
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home())
-        return base / APP_NAME / "screenshots"
+        return base / APP_NAME / name
 
 
 def pipe_name() -> str:
