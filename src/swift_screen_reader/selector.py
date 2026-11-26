@@ -193,3 +193,108 @@ class AreaHighlight(QWidget):
         p.setPen(QPen(QColor("#e53935"), 3))
         p.drawRect(self.rect().adjusted(1, 1, -2, -2))
         p.end()
+
+
+class PointPicker(QObject):
+    """Covers every screen; emits the tapped point (x, y) in physical pixels, or None if cancelled."""
+
+    finished = Signal(object)
+
+    def __init__(self, message: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._covers = [_PickCover(self, screen, message) for screen in QGuiApplication.screens()]
+        self._done = False
+
+    def start(self) -> None:
+        for cover in self._covers:
+            cover.show()
+            cover.setGeometry(cover.screen_.geometry())
+        under_mouse = QGuiApplication.screenAt(QCursor.pos())
+        target = next((c for c in self._covers if c.screen_ is under_mouse), self._covers[0])
+        target.activateWindow()
+        target.raise_()
+
+    def finish(self, point: tuple[int, int] | None) -> None:
+        if self._done:
+            return
+        self._done = True
+        for cover in self._covers:
+            cover.close()
+            cover.deleteLater()
+        self.finished.emit(point)
+
+
+class _PickCover(QWidget):
+    def __init__(self, picker: PointPicker, screen: QScreen, message: str) -> None:
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.picker = picker
+        self.screen_ = screen
+        self.message = message
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setGeometry(screen.geometry())
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        p = QPainter(self)
+        # Light tint so the POS buttons stay visible; alpha above 0 so taps don't fall through.
+        p.fillRect(self.rect(), QColor(0, 0, 0, 60))
+        metrics = p.fontMetrics()
+        box = metrics.boundingRect(self.message).adjusted(-14, -9, 14, 9)
+        box.moveCenter(QPoint(self.width() // 2, 40))
+        p.fillRect(box, QColor(30, 30, 30, 230))
+        p.setPen(QColor("white"))
+        p.drawText(box, Qt.AlignmentFlag.AlignCenter, self.message)
+        p.end()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            self.picker.finish(None)
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position().toPoint()
+        area = to_physical(self.screen_, QRect(pos.x(), pos.y(), 1, 1))
+        self.picker.finish((area.x, area.y))
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.picker.finish(None)
+
+    def closeEvent(self, event) -> None:
+        self.picker.finish(None)
+        super().closeEvent(event)
+
+
+class PointHighlight(QWidget):
+    """Click-through target marker drawn around a point for a moment."""
+
+    RADIUS = 28
+
+    def __init__(self, x: int, y: int, seconds: float = 2.5) -> None:
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        rect = to_logical(Area(x, y, 1, 1))
+        self.valid = rect is not None
+        if rect is not None:
+            r = self.RADIUS
+            self.setGeometry(rect.x() - r, rect.y() - r, 2 * r + 1, 2 * r + 1)
+        QTimer.singleShot(int(seconds * 1000), self.close)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.RADIUS
+        p.setPen(QPen(QColor("#e53935"), 3))
+        p.drawEllipse(QPoint(r, r), r - 3, r - 3)
+        p.drawLine(r, 4, r, 2 * r - 4)
+        p.drawLine(4, r, 2 * r - 4, r)
+        p.end()

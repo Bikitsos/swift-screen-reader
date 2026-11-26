@@ -56,6 +56,10 @@ class Transaction:
     payment_ms: int = 0
     finished: datetime | None = None
     dismissed: datetime | None = None
+    closed_by: str = ""  # "operator" (tapped) or "auto" (success screen timed out)
+    tap_point: str = ""
+    tap_method: str = ""
+    tap_error: str = ""
 
     @property
     def done(self) -> bool:
@@ -83,6 +87,9 @@ class Transaction:
             "started": stamp(self.started),
             "finished": stamp(self.finished),
             "dismissed": stamp(self.dismissed),
+            "closed_by": self.closed_by or None,
+            "auto_tap": {"point": self.tap_point, "method": self.tap_method, "error": self.tap_error or None}
+            if self.tap_point else None,
             "ocr": {
                 "label": self.label,
                 "lines": self.ocr_lines,
@@ -121,10 +128,22 @@ class TransactionRunner(QObject):
         threading.Thread(target=self._run, args=(tx, terminal_kind, delay), name=f"tx-{tx.id}", daemon=True).start()
         return tx
 
-    def dismiss(self, tx: Transaction) -> None:
+    def dismiss(self, tx: Transaction, by: str = "operator") -> None:
         tx.dismissed = datetime.now()
+        tx.closed_by = by
         seconds = (tx.dismissed - (tx.finished or tx.started)).total_seconds()
-        _log(tx, "result screen closed by the operator after %.1f s", seconds)
+        if by == "auto":
+            _log(tx, "result screen closed automatically after %.1f s", seconds)
+        else:
+            _log(tx, "result screen closed by the operator after %.1f s", seconds)
+        _save(tx)
+
+    def record_tap(self, tx: Transaction, point: str, method: str, error: str = "") -> None:
+        tx.tap_point, tx.tap_method, tx.tap_error = point, method, error
+        if error:
+            logging.error("TX %s: tapping the POS button at %s failed: %s", tx.id, point, error)
+        else:
+            _log(tx, "tapped the POS button at %s (%s)", point, method)
         _save(tx)
 
     def _run(self, tx: Transaction, terminal_kind: str, delay: float) -> None:

@@ -1,6 +1,6 @@
 # Swift Screen Reader
 
-A Windows tool for a point of sale: when called, it takes a **screenshot of a preselected screen area** (for example the POS subtotal), **reads the amount with OCR** and **takes the card payment** for it, showing a full-screen payment screen until the operator taps to continue. It stays resident in the system tray, so it reacts in a fraction of a second to a keyboard shortcut, the command line, another program or a local HTTP call.
+A Windows tool for a point of sale: when called, it takes a **screenshot of a preselected screen area** (for example the POS subtotal), **reads the amount with OCR** and **takes the card payment** for it on a full-screen payment screen, then presses a POS button of your choice to continue. It stays resident in the system tray, so it reacts in a fraction of a second to a keyboard shortcut, the command line, another program or a local HTTP call.
 
 The card terminal is simulated for now (every payment is approved); a real terminal will plug in when its API is available.
 
@@ -10,7 +10,7 @@ Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https
 
 - Drag-select the capture area once over a dimmed screen; it is remembered in physical pixels and works with multiple monitors and mixed scaling (100%, 150%, 200%...)
 - Resident tray service, started with Windows by the installer, that answers capture calls immediately
-- Global keyboard shortcuts that work anywhere, also while the app is hidden in the tray (default **Ctrl+Shift+F9** capture, **Ctrl+Shift+F10** select area; configurable)
+- Global keyboard shortcuts that work anywhere, also while the app is hidden in the tray (default **Ctrl+Shift+F9** capture, **Ctrl+Shift+F10** select area, **Ctrl+Shift+F11** pick the POS button; configurable)
 - Other ways to call it:
   - `SwiftScreenReaderCli.exe`: console tool that prints the saved file path (Qt-free, starts fast)
   - `SwiftScreenReader.exe --capture`: same, for launchers and shortcuts that want a windowed exe
@@ -20,7 +20,7 @@ Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https
 - Files are written atomically, so a program watching the folder never reads a half-written image
 - Optional copy to the clipboard and tray notification after each capture
 - Reads the amount after a label (default `Subtotal`) with the OCR engine built into Windows: no extra software, about 30 ms
-- Full-screen payment screen: "Processing payment..." then "Transaction successful", held until the operator taps anywhere; other captures are refused meanwhile, so nothing is charged twice
+- Full-screen payment screen: "Processing payment..." then "Transaction successful", which closes by itself and presses a POS button you picked (Ctrl+Shift+F11); failures stay until the operator taps. Other captures are refused meanwhile, so nothing is charged twice
 - A `.json` file next to each screenshot with the text read, the amount and the payment result
 - Detailed activity log (`logs\activity.log`, one file per day, kept 90 days) of every capture, OCR result, payment step and setting change
 - "Show area" briefly outlines the current capture area on screen
@@ -64,6 +64,7 @@ Settings are saved to `%APPDATA%\Swift Screen Reader\settings.json`.
 | --- | --- |
 | **Ctrl+Shift+F9** | Capture the area now (asks you to select one first if none is set) |
 | **Ctrl+Shift+F10** | Select a new capture area |
+| **Ctrl+Shift+F11** | Pick the POS button to press after a successful payment |
 
 They are system-wide: they work in any program while the app runs, even hidden in the tray. To change one, click its box in the window and press the new keys; the **×** turns it off and **Default** restores it. A shortcut needs Ctrl, Alt or Win plus a letter, digit, F-key or navigation key; F1-F24, Print and Pause also work on their own. If another program already uses a combination, the window shows it in red and you can pick a different one. The tray menu lists the active shortcuts.
 
@@ -75,15 +76,28 @@ Every capture made through the running app (shortcut, **Capture now**, the comma
 2. All monitors are covered with a dark screen: **Reading amount...**, then **Processing payment...** with the amount and a spinner. Mouse clicks and keys are swallowed.
 3. The amount is read with Windows OCR: the number after the label (default `Subtotal`) on the same line or the next one. `12.50`, `1,234.56`, `1.234,56`, `€ 12,50` are all understood.
 4. The amount is sent to the card terminal. For now this is a simulator that approves every payment after a short delay (default 2 s).
-5. The result stays on screen until the operator **taps anywhere** (or presses a key):
-   - **Transaction successful** (green) with the amount
+5. The result is shown:
+   - **Transaction successful** (green) with the amount. After 2 seconds it closes by itself and the app **presses the POS button you picked** (see below), so the operator doesn't have to touch anything.
    - **Transaction declined / failed** (red), for when a real terminal is connected
    - **Nothing to pay** (orange) when the amount is 0.00; nothing is charged
    - **Could not read the amount** (orange) with the text that was read; nothing is charged
 
-Until the result is tapped away, new captures are refused (the shortcut is ignored, the command line gets an error, HTTP returns 409), so a double press never charges twice. The payment screen is hidden from screen capture (Windows 10 2004 or later). It is not a Windows lock: no password is needed, and system keys such as the Windows key and Ctrl+Alt+Del still work.
+   Every result except success stays on screen until the operator **taps anywhere** (or presses a key), because someone has to see it.
+
+Until the transaction is finished (the success screen has closed and the button was pressed, or another result was tapped away), new captures are refused (the shortcut is ignored, the command line gets an error, HTTP returns 409), so a double press never charges twice. The payment screen is hidden from screen capture (Windows 10 2004 or later). It is not a Windows lock: no password is needed, and system keys such as the Windows key and Ctrl+Alt+Del still work.
 
 On the **Payment** page you can change the label, test the OCR on the current screen, choose the terminal and currency, set the simulated processing time, or turn the payment (or the OCR) off. With payment off, the amount is only read and recorded, without the payment screen. A command-line capture with `--direct` only saves the screenshot.
+
+### Pressing a POS button after a successful payment
+
+To continue on the POS automatically (for example its **Done** or **Card paid** button):
+
+1. Press **Ctrl+Shift+F11** anywhere (or **Payment → Pick button...**, or **Pick POS button...** in the tray menu). The screen dims slightly and shows *Tap the POS button to press after a successful payment*.
+2. Tap (or click) the button once. Its position is saved and briefly marked with a red target. Esc or right-click cancels.
+
+After each approved payment the success screen closes after the time set in **After a successful payment** (default 2 s, 1-30 s), then the app presses that point with a simulated **touch** (or, if you choose, a **mouse click**; the mouse pointer is put back afterwards). **Show** marks the saved position, **Test tap** presses it now. Turn off *Close the success screen automatically* to go back to tapping it away by hand, or *Then press this POS button* to close it without pressing anything. Taps are only made after a success, never after a failure.
+
+If the POS program runs as administrator, Windows blocks simulated input from normal programs; run Swift Screen Reader as administrator too in that case.
 
 ### Transaction records
 
@@ -100,6 +114,8 @@ Next to each screenshot a `.json` file with the same name records the transactio
   "started": "2026-11-25T13:02:41.276",
   "finished": "2026-11-25T13:02:43.450",
   "dismissed": "2026-11-25T13:02:45.643",
+  "closed_by": "auto",
+  "auto_tap": {"point": "860,680", "method": "touch", "error": null},
   "ocr": {"label": "Subtotal", "lines": ["Subtotal", "12.50"], "amount_text": "12.50", "ms": 28},
   "amount": "12.50",
   "currency": "EUR",
@@ -248,6 +264,7 @@ src/swift_screen_reader/
   overlay.py   full-screen payment screens (processing, result)
   ocr.py       Windows OCR and finding the amount after the label
   payment.py   card terminal interface and the simulator
+  tap.py       simulated touch / mouse click on the POS button
   transaction.py  capture -> OCR -> payment run, logging and .json records
   selector.py  area selection overlay and area highlight
   gui.py       tray app and window

@@ -16,6 +16,7 @@ DEFAULT_FILE_NAME = "screenshot_{timestamp}.png"
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_HOTKEY_CAPTURE = "Ctrl+Shift+F9"
 DEFAULT_HOTKEY_SELECT = "Ctrl+Shift+F10"
+DEFAULT_HOTKEY_TAP = "Ctrl+Shift+F11"
 DEFAULT_AMOUNT_LABEL = "Subtotal"
 
 
@@ -63,6 +64,12 @@ class Settings:
     terminal: str = "simulated"
     simulated_seconds: int = 2
     currency: str = "EUR"
+    success_auto_close: bool = True
+    success_seconds: int = 2
+    tap_enabled: bool = True
+    tap_point: str = ""  # "x,y" in physical pixels; empty = not picked yet
+    tap_method: str = "touch"
+    hotkey_tap: str = DEFAULT_HOTKEY_TAP
     check_updates: bool = True
     extra: dict = field(default_factory=dict, repr=False)
 

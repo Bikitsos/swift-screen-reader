@@ -44,19 +44,22 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, CLI_EXE_NAME, COMPANY, CREDITS, EXE_NAME, __version__, build_info, config, default_logs_dir, ipc, pipe_name
 from .capture import CaptureError, capture_png
-from .config import DEFAULT_AMOUNT_LABEL, DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, Area
+from .config import DEFAULT_AMOUNT_LABEL, DEFAULT_FILE_NAME, DEFAULT_HOTKEY_CAPTURE, DEFAULT_HOTKEY_SELECT, DEFAULT_HOTKEY_TAP, Area
 from .hotkeys import HotkeyManager, display
 from .ocr import OcrError, recognize
 from .ocr import warm_up as ocr_warm_up
 from .overlay import FAILURE, SUCCESS, WARNING, PaymentScreen
 from .payment import APPROVED, DECLINED, ERROR, TERMINALS
-from .selector import AreaHighlight, AreaSelector
+from .selector import AreaHighlight, AreaSelector, PointHighlight, PointPicker
 from .service import BusyError, CaptureService
+from .tap import TAP_METHODS, TapError, parse_point, tap
 from .transaction import NO_AMOUNT, PAYING, READ, ZERO, Transaction, TransactionRunner, format_amount
 from .updater import Release, UpdateChecker, UpdateDownloader, can_self_update, is_newer, run_installer
 
 COORD_LIMIT = 100_000
-CAPTURE, SELECT = "Capture now", "Select area"
+CAPTURE, SELECT, PICK = "Capture now", "Select area", "Pick POS button"
+# Wait after the payment screen closes before tapping, so the tap reaches the POS and not the closing cover.
+TAP_DELAY_MS = 200
 PORTABLE = QKeySequence.SequenceFormat.PortableText
 LOG_NAME = "activity.log"
 
@@ -166,6 +169,7 @@ class MainWindow(QMainWindow):
         self.last_tx: Transaction | None = None
         self.last_path: str | None = None
         self._selector: AreaSelector | None = None
+        self._picker: PointPicker | None = None
         self._service_started = False
         self._loading = False
         self._tray_hint_shown = False
@@ -408,10 +412,40 @@ class MainWindow(QMainWindow):
         self.sim_spin.setSuffix(" s")
         self.sim_spin.valueChanged.connect(self._schedule_save)
         pay_form.addRow("Simulated processing time:", _row(self.sim_spin))
-        pay_form.addRow("", _hint("Shows \u201cProcessing payment...\u201d, then the result until the operator taps.\n"
-                                  "Other captures are refused until then, so nothing is charged twice.\n"
-                                  "Real terminals will be added here."))
+        pay_form.addRow("", _hint("Shows \u201cProcessing payment...\u201d, then the result.\n"
+                                  "Other captures are refused until the transaction is finished, so nothing is "
+                                  "charged twice.\nReal terminals will be added here."))
         layout.addWidget(pay_box)
+
+        after_box = QGroupBox("After a successful payment")
+        after_form = QFormLayout(after_box)
+        self.auto_close_check = QCheckBox("Close the success screen automatically after")
+        self.auto_close_check.toggled.connect(self._schedule_save)
+        self.success_spin = QSpinBox()
+        self.success_spin.setRange(1, 30)
+        self.success_spin.setSuffix(" s")
+        self.success_spin.valueChanged.connect(self._schedule_save)
+        after_form.addRow("", _row(self.auto_close_check, self.success_spin))
+        self.tap_check = QCheckBox("Then press this POS button:")
+        self.tap_check.toggled.connect(self._schedule_save)
+        self.tap_label = QLabel()
+        self.tap_label.setStyleSheet("font-weight: bold;")
+        after_form.addRow("", _row(self.tap_check, self.tap_label))
+        pick = QPushButton("Pick button...")
+        pick.clicked.connect(self.pick_tap_point)
+        show_point = QPushButton("Show")
+        show_point.clicked.connect(self.show_tap_point)
+        test_tap = QPushButton("Test tap")
+        test_tap.clicked.connect(self.test_tap)
+        after_form.addRow("", _row(pick, show_point, test_tap))
+        self.tap_method_combo = QComboBox()
+        for key, name in TAP_METHODS.items():
+            self.tap_method_combo.addItem(name, key)
+        self.tap_method_combo.currentIndexChanged.connect(self._schedule_save)
+        after_form.addRow("Press it with:", _row(self.tap_method_combo))
+        self.pick_hint = _hint("")
+        after_form.addRow("", self.pick_hint)
+        layout.addWidget(after_box)
         layout.addStretch(1)
         return page
 
@@ -420,7 +454,8 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Keyboard shortcuts")
         form = QFormLayout(box)
         self.hotkey_edits: dict[str, QKeySequenceEdit] = {}
-        for name, default in ((CAPTURE, DEFAULT_HOTKEY_CAPTURE), (SELECT, DEFAULT_HOTKEY_SELECT)):
+        for name, default in ((CAPTURE, DEFAULT_HOTKEY_CAPTURE), (SELECT, DEFAULT_HOTKEY_SELECT),
+                              (PICK, DEFAULT_HOTKEY_TAP)):
             edit = QKeySequenceEdit()
             edit.setMaximumSequenceLength(1)
             edit.setClearButtonEnabled(True)
@@ -492,7 +527,9 @@ class MainWindow(QMainWindow):
         bold.triggered.connect(lambda: self.capture_now("tray"))
         menu.addAction(bold)
         select = menu.addAction("Select area...", self.select_area)
-        self._tray_actions = {CAPTURE: (bold, "Capture now"), SELECT: (select, "Select area...")}
+        pick = menu.addAction("Pick POS button...", self.pick_tap_point)
+        self._tray_actions = {CAPTURE: (bold, "Capture now"), SELECT: (select, "Select area..."),
+                              PICK: (pick, "Pick POS button...")}
         menu.addAction("Show area", self.show_area)
         menu.addAction("Open screenshots folder", self.open_folder)
         menu.addSeparator()
@@ -524,6 +561,11 @@ class MainWindow(QMainWindow):
         self.update_check.setChecked(s.check_updates)
         self.hotkey_edits[CAPTURE].setKeySequence(QKeySequence.fromString(s.hotkey_capture, PORTABLE))
         self.hotkey_edits[SELECT].setKeySequence(QKeySequence.fromString(s.hotkey_select, PORTABLE))
+        self.hotkey_edits[PICK].setKeySequence(QKeySequence.fromString(s.hotkey_tap, PORTABLE))
+        self.auto_close_check.setChecked(s.success_auto_close)
+        self.success_spin.setValue(s.success_seconds)
+        self.tap_check.setChecked(s.tap_enabled)
+        self.tap_method_combo.setCurrentIndex(max(0, self.tap_method_combo.findData(s.tap_method)))
         self.ocr_check.setChecked(s.ocr_enabled)
         self.label_edit.setText("" if s.amount_label == DEFAULT_AMOUNT_LABEL else s.amount_label)
         self.payment_check.setChecked(s.payment_enabled)
@@ -547,6 +589,11 @@ class MainWindow(QMainWindow):
         s.check_updates = self.update_check.isChecked()
         s.hotkey_capture = self.hotkey_edits[CAPTURE].keySequence().toString(PORTABLE)
         s.hotkey_select = self.hotkey_edits[SELECT].keySequence().toString(PORTABLE)
+        s.hotkey_tap = self.hotkey_edits[PICK].keySequence().toString(PORTABLE)
+        s.success_auto_close = self.auto_close_check.isChecked()
+        s.success_seconds = self.success_spin.value()
+        s.tap_enabled = self.tap_check.isChecked()
+        s.tap_method = self.tap_method_combo.currentData() or "touch"
         s.ocr_enabled = self.ocr_check.isChecked()
         s.amount_label = self.label_edit.text().strip() or DEFAULT_AMOUNT_LABEL
         s.payment_enabled = self.payment_check.isChecked()
@@ -560,7 +607,16 @@ class MainWindow(QMainWindow):
         s = self.settings
         for widget in (self.payment_check, self.terminal_combo, self.currency_edit, self.sim_spin, self.label_edit):
             widget.setEnabled(s.ocr_enabled)
+        self.success_spin.setEnabled(s.success_auto_close)
         self.service.hold_after_capture = s.ocr_enabled and s.payment_enabled
+        point = parse_point(s.tap_point)
+        self.tap_label.setText(f"({point[0]}, {point[1]})" if point else "not picked yet")
+        key = display(s.hotkey_tap) if s.hotkey_tap else ""
+        self.pick_hint.setText(
+            f"Pick button... (or {key} anywhere): tap the POS button once to save its position.\n"
+            "Failed, declined or unread payments still wait for the operator to tap." if key else
+            "Pick button...: tap the POS button once to save its position.\n"
+            "Failed, declined or unread payments still wait for the operator to tap.")
         self._update_home()
 
     def _save_settings(self) -> None:
@@ -616,6 +672,9 @@ class MainWindow(QMainWindow):
                 "capture and read the amount" if s.ocr_enabled else "capture")
             key = display(s.hotkey_capture) if s.hotkey_capture else ""
             detail = f"Press {key} anywhere to {action}." if key else f"Click Capture now to {action}."
+            if s.ocr_enabled and s.payment_enabled and s.tap_enabled and not parse_point(s.tap_point):
+                pick = display(s.hotkey_tap) if s.hotkey_tap else "Payment > Pick button..."
+                detail += f"\nNo POS button picked yet for after a successful payment (use {pick})."
         self.status_title.setText(title)
         self.status_title.setStyleSheet(f"color: {color};")
         self.status_detail.setText(detail)
@@ -665,7 +724,8 @@ class MainWindow(QMainWindow):
     def apply_hotkeys(self) -> None:
         if not self._service_started:
             return
-        shortcuts = {CAPTURE: self.settings.hotkey_capture, SELECT: self.settings.hotkey_select}
+        shortcuts = {CAPTURE: self.settings.hotkey_capture, SELECT: self.settings.hotkey_select,
+                     PICK: self.settings.hotkey_tap}
         errors = self.hotkeys.apply(shortcuts)
         active = [name for name, text in shortcuts.items() if text and name not in errors]
         if errors:
@@ -683,15 +743,19 @@ class MainWindow(QMainWindow):
         self._update_home()
 
     def _on_hotkey(self, name: str) -> None:
-        text = self.settings.hotkey_capture if name == CAPTURE else self.settings.hotkey_select
+        text = {CAPTURE: self.settings.hotkey_capture, SELECT: self.settings.hotkey_select,
+                PICK: self.settings.hotkey_tap}[name]
         logging.info("Shortcut %s pressed: %s", display(text), name)
-        if self._selector is not None or self.screen_cover.visible:
-            logging.info("Shortcut ignored: %s", "area selection is open" if self._selector else "payment screen is showing")
+        if self._selector is not None or self._picker is not None or self.screen_cover.visible:
+            logging.info("Shortcut ignored: %s", "payment screen is showing" if self.screen_cover.visible
+                         else "a selection is open")
             return
         if name == CAPTURE:
             self.capture_now("shortcut")
         elif name == SELECT:
             self.select_area()
+        elif name == PICK:
+            self.pick_tap_point()
 
     # -- capture and transactions --------------------------------------------
 
@@ -764,7 +828,9 @@ class MainWindow(QMainWindow):
             self._end_transaction(tx)
             return
         if tx.status == APPROVED:
-            self.screen_cover.show_result(SUCCESS, "Transaction successful", tx.amount_display)
+            auto = self.settings.success_seconds if self.settings.success_auto_close else None
+            self.screen_cover.show_result(SUCCESS, "Transaction successful", tx.amount_display,
+                                          "Continuing..." if auto else "Tap anywhere to continue", auto_close_seconds=auto)
         elif tx.status in (DECLINED, ERROR):
             self.screen_cover.show_result(FAILURE, "Transaction declined" if tx.status == DECLINED else "Transaction failed",
                                           tx.message)
@@ -774,11 +840,27 @@ class MainWindow(QMainWindow):
             self.screen_cover.show_result(WARNING, "Could not read the amount", tx.message)
         logging.info("TX %s: result screen shown (%s)", tx.id, STATUS_TEXT.get(tx.status, tx.status))
 
-    def _on_result_dismissed(self) -> None:
+    def _on_result_dismissed(self, by: str) -> None:
         tx = self.current_tx
-        if tx is not None:
-            self.runner.dismiss(tx)
+        if tx is None:
+            return
+        self.runner.dismiss(tx, by)
+        point = parse_point(self.settings.tap_point)
+        if tx.status == APPROVED and self.settings.tap_enabled and point:
+            # Still busy until the tap is done, so a capture can't sneak in between.
+            QTimer.singleShot(TAP_DELAY_MS, lambda: self._tap_pos_button(tx, point))
+        else:
             self._end_transaction(tx)
+
+    def _tap_pos_button(self, tx: Transaction, point: tuple[int, int]) -> None:
+        text = f"{point[0]},{point[1]}"
+        try:
+            method = tap(*point, self.settings.tap_method)
+        except TapError as exc:
+            self.runner.record_tap(tx, text, self.settings.tap_method, str(exc))
+        else:
+            self.runner.record_tap(tx, text, method)
+        self._end_transaction(tx)
 
     def _end_transaction(self, tx: Transaction) -> None:
         if self.current_tx is tx:
@@ -858,6 +940,65 @@ class MainWindow(QMainWindow):
         else:
             highlight.deleteLater()
             logging.warning("The capture area %s is not on any connected screen", self.settings.area)
+
+    def pick_tap_point(self) -> None:
+        if self._picker is not None or self._selector is not None or self.screen_cover.visible:
+            return
+        was_visible = self.isVisible()
+        self.hide()
+        logging.info("POS button picker opened")
+
+        def done(point: tuple[int, int] | None) -> None:
+            self._picker = None
+            if point is not None:
+                self.settings.tap_point = f"{point[0]},{point[1]}"
+                if not self.tap_check.isChecked():
+                    self.tap_check.setChecked(True)
+                self._schedule_save()
+                logging.info("POS button set to (%d, %d)", *point)
+                self.show_tap_point()
+            else:
+                logging.info("POS button picker cancelled")
+            if was_visible:
+                self.show_window()
+
+        def start() -> None:
+            self._picker = PointPicker("Tap the POS button to press after a successful payment.   Esc to cancel.", self)
+            self._picker.finished.connect(done)
+            self._picker.start()
+
+        QTimer.singleShot(200, start)
+
+    def show_tap_point(self) -> None:
+        point = parse_point(self.settings.tap_point)
+        if point is None:
+            QMessageBox.information(self, APP_NAME, "No POS button picked yet.")
+            return
+        marker = PointHighlight(*point)
+        if marker.valid:
+            marker.show()
+        else:
+            marker.deleteLater()
+            logging.warning("The POS button position (%d, %d) is not on any connected screen", *point)
+
+    def test_tap(self) -> None:
+        point = parse_point(self.settings.tap_point)
+        if point is None:
+            QMessageBox.information(self, APP_NAME, "Pick the POS button first.")
+            return
+        was_visible = self.isVisible()
+        self.hide()  # the window may be covering the button
+
+        def run() -> None:
+            try:
+                method = tap(*point, self.settings.tap_method)
+                logging.info("Test tap at (%d, %d) (%s)", point[0], point[1], method)
+            except TapError as exc:
+                logging.error("Test tap at (%d, %d) failed: %s", point[0], point[1], exc)
+            if was_visible:
+                QTimer.singleShot(500, self.show_window)
+
+        QTimer.singleShot(TAP_DELAY_MS + 200, run)
 
     def _open_path(self, path: str | Path) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))

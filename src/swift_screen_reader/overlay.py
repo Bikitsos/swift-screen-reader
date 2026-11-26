@@ -21,7 +21,7 @@ COLORS = {SUCCESS: QColor("#2e7d32"), FAILURE: QColor("#c62828"), WARNING: QColo
 class PaymentScreen(QObject):
     """Covers all screens and swallows input; a result screen emits `dismissed` when tapped anywhere."""
 
-    dismissed = Signal()
+    dismissed = Signal(str)  # "operator" (tapped) or "auto" (timed out)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -31,21 +31,31 @@ class PaymentScreen(QObject):
         self._spin = QTimer(self, interval=40)
         self._spin.timeout.connect(self._tick)
         self._angle = 0
+        self._auto = QTimer(self, singleShot=True)
+        self._auto.timeout.connect(lambda: self._close("auto"))
 
     @property
     def visible(self) -> bool:
         return bool(self._covers)
 
     def show_processing(self, title: str, detail: str = "") -> None:
+        self._auto.stop()
         self._show(PROCESSING, title, detail, "")
         self._spin.start()
 
-    def show_result(self, kind: str, title: str, detail: str, hint: str = "Tap anywhere to continue") -> None:
+    def show_result(self, kind: str, title: str, detail: str, hint: str = "Tap anywhere to continue",
+                    auto_close_seconds: float | None = None) -> None:
+        """Show a result; with `auto_close_seconds` it closes by itself (a tap still closes it sooner)."""
         self._spin.stop()
         self._show(kind, title, detail, hint)
+        if auto_close_seconds is not None:
+            self._auto.start(int(auto_close_seconds * 1000))
+        else:
+            self._auto.stop()
 
     def hide(self) -> None:
         self._spin.stop()
+        self._auto.stop()
         covers, self._covers = self._covers, []
         for cover in covers:
             cover.releaseKeyboard()
@@ -72,8 +82,13 @@ class PaymentScreen(QObject):
 
     def _on_input(self) -> None:
         if self.kind and self.kind != PROCESSING and time.monotonic() - self._shown_at >= DISMISS_GUARD_SECONDS:
-            self.hide()
-            self.dismissed.emit()
+            self._close("operator")
+
+    def _close(self, by: str) -> None:
+        if not self._covers:
+            return
+        self.hide()
+        self.dismissed.emit(by)
 
 
 class _Cover(QWidget):
