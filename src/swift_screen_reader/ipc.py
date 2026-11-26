@@ -13,6 +13,7 @@ from . import pipe_name
 
 ERROR_PIPE_BUSY = 231
 ERROR_ALREADY_EXISTS = 183
+ERROR_ACCESS_DENIED = 5
 MAX_REPLY = 1024 * 1024
 
 
@@ -36,9 +37,11 @@ def acquire_instance_lock() -> bool:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.restype = ctypes.c_void_p
     handle = kernel32.CreateMutexW(None, False, f"Local\\{pipe_name()}")
+    error = ctypes.get_last_error()
     if not handle:
-        return True  # can't tell; fall back to the pipe check
-    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        # An administrator copy's mutex can't be opened by a normal copy: it still means "running".
+        return error != ERROR_ACCESS_DENIED
+    if error == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(ctypes.c_void_p(handle))
         return False
     _instance_lock = handle

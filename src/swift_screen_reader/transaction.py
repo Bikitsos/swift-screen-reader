@@ -60,6 +60,7 @@ class Transaction:
     tap_point: str = ""
     tap_method: str = ""
     tap_error: str = ""
+    tap_target: str = ""
 
     @property
     def done(self) -> bool:
@@ -88,7 +89,8 @@ class Transaction:
             "finished": stamp(self.finished),
             "dismissed": stamp(self.dismissed),
             "closed_by": self.closed_by or None,
-            "auto_tap": {"point": self.tap_point, "method": self.tap_method, "error": self.tap_error or None}
+            "auto_tap": {"point": self.tap_point, "method": self.tap_method, "program": self.tap_target or None,
+                         "error": self.tap_error or None}
             if self.tap_point else None,
             "ocr": {
                 "label": self.label,
@@ -138,12 +140,12 @@ class TransactionRunner(QObject):
             _log(tx, "result screen closed by the operator after %.1f s", seconds)
         _save(tx)
 
-    def record_tap(self, tx: Transaction, point: str, method: str, error: str = "") -> None:
-        tx.tap_point, tx.tap_method, tx.tap_error = point, method, error
+    def record_tap(self, tx: Transaction, point: str, method: str, error: str = "", target: str = "") -> None:
+        tx.tap_point, tx.tap_method, tx.tap_error, tx.tap_target = point, method, error, target
         if error:
             logging.error("TX %s: tapping the POS button at %s failed: %s", tx.id, point, error)
         else:
-            _log(tx, "tapped the POS button at %s (%s)", point, method)
+            _log(tx, "tapped the POS button at %s in %s (%s)", point, target or "?", method)
         _save(tx)
 
     def _run(self, tx: Transaction, terminal_kind: str, delay: float) -> None:

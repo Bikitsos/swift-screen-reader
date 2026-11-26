@@ -46,6 +46,9 @@ class CaptureService(QObject):
 
     def start(self) -> bool:
         """Listen on the pipe; False if another instance already owns it."""
+        # Grant the user account, not just administrators, so a normal command line can reach a copy
+        # running as administrator.
+        self._server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         if not self._server.listen(pipe_name()):
             logging.error("Cannot listen on pipe %s: %s", pipe_name(), self._server.errorString())
             return False

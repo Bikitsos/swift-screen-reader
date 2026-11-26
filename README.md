@@ -97,7 +97,14 @@ To continue on the POS automatically (for example its **Done** or **Card paid** 
 
 After each approved payment the success screen closes after the time set in **After a successful payment** (default 2 s, 1-30 s), then the app presses that point with a simulated **touch** (or, if you choose, a **mouse click**; the mouse pointer is put back afterwards). **Show** marks the saved position, **Test tap** presses it now. Turn off *Close the success screen automatically* to go back to tapping it away by hand, or *Then press this POS button* to close it without pressing anything. Taps are only made after a success, never after a failure.
 
-If the POS program runs as administrator, Windows blocks simulated input from normal programs; run Swift Screen Reader as administrator too in that case.
+#### When the POS program runs as administrator
+
+Windows does not let a normal program send taps or clicks to a program that runs as administrator. If your POS does, Swift Screen Reader must run as administrator too, otherwise the log shows *"... runs as administrator, so Windows blocks simulated taps"* and the button is not pressed. The app warns about this as soon as you pick a button in such a program, and on the **Home** page after a failed tap.
+
+1. **Service → Restart as administrator** (or the button on **Home**). Windows asks for permission once. The window title then ends in *(Administrator)*.
+2. Tick **Service → Start with Windows as administrator**. This creates a Task Scheduler task named *Swift Screen Reader* that starts the app as administrator at logon, without a permission prompt, and removes the normal startup entry. Updates restart the app through the same task. Untick it to go back to a normal start.
+
+The POS can keep calling `SwiftScreenReaderCli.exe` as before; the command line also reaches the app when it runs as administrator. Uninstalling removes the task.
 
 ### Transaction records
 
@@ -265,6 +272,7 @@ src/swift_screen_reader/
   ocr.py       Windows OCR and finding the amount after the label
   payment.py   card terminal interface and the simulator
   tap.py       simulated touch / mouse click on the POS button
+  elevation.py administrator detection, restart as administrator, start-at-logon task
   transaction.py  capture -> OCR -> payment run, logging and .json records
   selector.py  area selection overlay and area highlight
   gui.py       tray app and window

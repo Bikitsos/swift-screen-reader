@@ -97,7 +97,8 @@ def _click(x: int, y: int) -> None:
     previous = wintypes.POINT()
     _user32.GetCursorPos(ctypes.byref(previous))
     if not _user32.SetCursorPos(x, y):
-        raise TapError(f"Could not move the mouse (error {ctypes.get_last_error()})")
+        raise TapError(f"Could not move the mouse (error {ctypes.get_last_error()}; usually the program "
+                       "there runs as administrator)")
     time.sleep(0.02)
     _user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(HOLD_SECONDS)
@@ -106,16 +107,31 @@ def _click(x: int, y: int) -> None:
     _user32.SetCursorPos(previous.x, previous.y)
 
 
-def tap(x: int, y: int, method: str = TOUCH) -> str:
-    """Tap at (x, y). Falls back to a mouse click if touch injection is unavailable; returns the method used."""
+def tap(x: int, y: int, method: str = TOUCH) -> tuple[str, str]:
+    """Tap at (x, y); returns (method used, program that was tapped).
+
+    Falls back to a mouse click if touch injection fails. Raises TapError with a clear reason, in
+    particular when the target runs as administrator and this app doesn't (Windows blocks that).
+    """
     if sys.platform != "win32":
         raise TapError("Simulated taps are only supported on Windows.")
+    from .elevation import is_elevated, window_owner_at
+
+    owner = window_owner_at(x, y)
+    target = owner.name if owner else "nothing"
+    if owner and owner.elevated and not is_elevated():
+        raise TapError(f"{owner.name} runs as administrator, so Windows blocks simulated taps from "
+                       "Swift Screen Reader. Run Swift Screen Reader as administrator (Service page).")
     if method == TOUCH:
         try:
             _touch(x, y)
-            return TOUCH
-        except TapError:
+            return TOUCH, target
+        except TapError as exc:
+            touch_error = str(exc)
+        try:
             _click(x, y)
-            return MOUSE
+        except TapError as exc:
+            raise TapError(f"{touch_error}; mouse click also failed: {exc}") from exc
+        return f"{MOUSE} (touch failed: {touch_error})", target
     _click(x, y)
-    return MOUSE
+    return MOUSE, target

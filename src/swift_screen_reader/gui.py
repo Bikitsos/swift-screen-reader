@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -53,6 +54,7 @@ from .payment import APPROVED, DECLINED, ERROR, TERMINALS
 from .selector import AreaHighlight, AreaSelector, PointHighlight, PointPicker
 from .service import BusyError, CaptureService
 from .tap import TAP_METHODS, TapError, parse_point, tap
+from .elevation import is_elevated, relaunch_elevated, set_startup_task, startup_task_exists, window_owner_at
 from .transaction import NO_AMOUNT, PAYING, READ, ZERO, Transaction, TransactionRunner, format_amount
 from .updater import Release, UpdateChecker, UpdateDownloader, can_self_update, is_newer, run_installer
 
@@ -152,7 +154,7 @@ def setup_file_logging() -> Path | None:
 class MainWindow(QMainWindow):
     def __init__(self, log_emitter: LogEmitter, log_file: Path | None = None) -> None:
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {__version__}")
+        self.setWindowTitle(f"{APP_NAME} {__version__}" + (" (Administrator)" if is_elevated() else ""))
         self.resize(900, 640)
         self.log_file = log_file
         self.settings = config.load()
@@ -166,6 +168,7 @@ class MainWindow(QMainWindow):
         self.screen_cover = PaymentScreen(self)
         self.screen_cover.dismissed.connect(self._on_result_dismissed)
         self.current_tx: Transaction | None = None
+        self._tap_problem = ""
         self.last_tx: Transaction | None = None
         self.last_path: str | None = None
         self._selector: AreaSelector | None = None
@@ -263,6 +266,13 @@ class MainWindow(QMainWindow):
         self.status_detail.setStyleSheet("font-size: 11pt;")
         layout.addWidget(self.status_title)
         layout.addWidget(self.status_detail)
+        self.problem_label = QLabel()
+        self.problem_label.setWordWrap(True)
+        self.problem_label.setStyleSheet("color: #c62828; font-size: 11pt;")
+        self.problem_button = QPushButton("Restart as administrator")
+        self.problem_button.clicked.connect(self.restart_as_admin)
+        layout.addWidget(self.problem_label)
+        layout.addLayout(_row(self.problem_button))
         layout.addSpacing(10)
 
         capture = QPushButton("Capture now")
@@ -498,6 +508,23 @@ class MainWindow(QMainWindow):
             f"{EXE_NAME}.exe --capture, or GET http://127.0.0.1:<port>/capture or /capture.png."
         ))
         layout.addWidget(box)
+
+        admin_box = QGroupBox("Administrator")
+        admin_form = QFormLayout(admin_box)
+        self.admin_label = QLabel()
+        self.admin_label.setStyleSheet("font-weight: bold;")
+        admin_form.addRow("Status:", self.admin_label)
+        self.restart_admin_button = QPushButton("Restart as administrator")
+        self.restart_admin_button.clicked.connect(self.restart_as_admin)
+        admin_form.addRow("", _row(self.restart_admin_button))
+        self.admin_startup_check = QCheckBox("Start with Windows as administrator (no permission prompt)")
+        self.admin_startup_check.toggled.connect(self._on_admin_startup_toggled)
+        admin_form.addRow("", self.admin_startup_check)
+        admin_form.addRow("", _hint("Needed when the POS program runs as administrator: Windows blocks simulated "
+                                    "taps\nfrom programs that don't. Restart as administrator once, then tick the "
+                                    "box above\nso it always starts that way (a Task Scheduler task replaces the "
+                                    "normal startup entry)."))
+        layout.addWidget(admin_box)
         layout.addStretch(1)
         return page
 
@@ -575,6 +602,7 @@ class MainWindow(QMainWindow):
         self._loading = False
         self._apply_payment_state()
         self._update_area_label()
+        self._update_admin_status()
 
     def _schedule_save(self) -> None:
         if self._loading:
@@ -678,6 +706,10 @@ class MainWindow(QMainWindow):
         self.status_title.setText(title)
         self.status_title.setStyleSheet(f"color: {color};")
         self.status_detail.setText(detail)
+        problem = getattr(self, "_tap_problem", "")
+        self.problem_label.setText(f"The POS button could not be pressed: {problem}" if problem else "")
+        self.problem_label.setVisible(bool(problem))
+        self.problem_button.setVisible(bool(problem) and "administrator" in problem and not is_elevated())
 
     def _on_http_changed(self) -> None:
         if self._loading:
@@ -703,6 +735,68 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Screenshots folder", str(self.settings.screenshots_dir()))
         if folder:
             self.folder_edit.setText(folder)
+
+    # -- administrator --------------------------------------------------------
+
+    def _update_admin_status(self) -> None:
+        elevated = is_elevated()
+        self.admin_label.setText("Running as administrator" if elevated else "Not running as administrator")
+        self.admin_label.setStyleSheet(f"font-weight: bold; color: {'#2e7d32' if elevated else '#888'};")
+        self.restart_admin_button.setVisible(not elevated)
+        self._loading, was_loading = True, self._loading
+        self.admin_startup_check.setChecked(startup_task_exists())
+        self._loading = was_loading
+        self.admin_startup_check.setEnabled(elevated)
+        self.admin_startup_check.setToolTip("" if elevated else "Restart as administrator first.")
+
+    def restart_as_admin(self) -> None:
+        if self.service.busy:
+            QMessageBox.information(self, APP_NAME, "Finish the current transaction first.")
+            return
+        args = ["--replace", str(os.getpid())] + ([] if self.isVisible() else ["--minimized"])
+        error = relaunch_elevated(*args)
+        if error == "cancelled":
+            logging.info("Restart as administrator cancelled at the Windows prompt")
+            return
+        if error:
+            logging.error("Could not restart as administrator: %s", error)
+            QMessageBox.warning(self, APP_NAME, f"Could not restart as administrator ({error}).")
+            return
+        logging.info("Restarting as administrator")
+        self.quit()
+
+    def _on_admin_startup_toggled(self, checked: bool) -> None:
+        if self._loading:
+            return
+        error = set_startup_task(checked)
+        if error:
+            logging.error("Could not change the start-at-logon task: %s", error)
+            QMessageBox.warning(self, APP_NAME, f"Could not change how the app starts with Windows.\n\n{error}")
+        self._update_admin_status()
+
+    def _check_tap_target(self, point: tuple[int, int]) -> None:
+        owner = window_owner_at(*point)
+        if owner is None:
+            logging.warning("No window found at the POS button position (%d, %d)", *point)
+            return
+        admin = {True: "yes", False: "no", None: "unknown"}[owner.elevated]
+        logging.info("POS button is in %s (runs as administrator: %s)", owner.name, admin)
+        if owner.elevated and not is_elevated():
+            self._tap_problem = (f"{owner.name} runs as administrator, so Windows blocks simulated taps from "
+                                 "Swift Screen Reader. Run Swift Screen Reader as administrator (Service page).")
+            self._update_home()
+            box = QMessageBox(QMessageBox.Icon.Warning, APP_NAME,
+                              f"{owner.name} runs as administrator.\n\nWindows only lets programs that also run as "
+                              "administrator press its buttons. Restart Swift Screen Reader as administrator now?",
+                              parent=self)
+            restart = box.addButton("Restart as administrator", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is restart:
+                self.restart_as_admin()
+        else:
+            self._tap_problem = ""
+            self._update_home()
 
     # -- keyboard shortcuts ---------------------------------------------------
 
@@ -855,11 +949,16 @@ class MainWindow(QMainWindow):
     def _tap_pos_button(self, tx: Transaction, point: tuple[int, int]) -> None:
         text = f"{point[0]},{point[1]}"
         try:
-            method = tap(*point, self.settings.tap_method)
+            method, target = tap(*point, self.settings.tap_method)
         except TapError as exc:
             self.runner.record_tap(tx, text, self.settings.tap_method, str(exc))
+            self._tap_problem = str(exc)
+            if self.settings.notify or "administrator" in str(exc):
+                self.tray.showMessage(APP_NAME, f"Could not press the POS button: {exc}",
+                                      QSystemTrayIcon.MessageIcon.Warning, 8000)
         else:
-            self.runner.record_tap(tx, text, method)
+            self.runner.record_tap(tx, text, method, target=target)
+            self._tap_problem = ""
         self._end_transaction(tx)
 
     def _end_transaction(self, tx: Transaction) -> None:
@@ -957,6 +1056,8 @@ class MainWindow(QMainWindow):
                 self._schedule_save()
                 logging.info("POS button set to (%d, %d)", *point)
                 self.show_tap_point()
+                # Once the picker is gone, see which program owns the button.
+                QTimer.singleShot(400, lambda: self._check_tap_target(point))
             else:
                 logging.info("POS button picker cancelled")
             if was_visible:
@@ -991,10 +1092,13 @@ class MainWindow(QMainWindow):
 
         def run() -> None:
             try:
-                method = tap(*point, self.settings.tap_method)
-                logging.info("Test tap at (%d, %d) (%s)", point[0], point[1], method)
+                method, target = tap(*point, self.settings.tap_method)
+                logging.info("Test tap at (%d, %d) in %s (%s)", point[0], point[1], target, method)
+                self._tap_problem = ""
             except TapError as exc:
                 logging.error("Test tap at (%d, %d) failed: %s", point[0], point[1], exc)
+                self._tap_problem = str(exc)
+            self._update_home()
             if was_visible:
                 QTimer.singleShot(500, self.show_window)
 
@@ -1169,7 +1273,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--select", action="store_true", help="start by selecting the capture area")
     parser.add_argument("--capture", action="store_true", help="take a screenshot and exit (see the CLI for options)")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    parser.add_argument("--replace", type=int, metavar="PID", help=argparse.SUPPRESS)
     args, qt_args = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+
+    if args.replace:
+        # Restarted (e.g. as administrator): let the old copy exit and release the pipe first.
+        from .elevation import wait_for_exit
+
+        wait_for_exit(args.replace, 15)
 
     # Single instance: hand the request to the running copy instead of starting another one.
     request = {"cmd": "select" if args.select else ("ping" if args.minimized else "show")}

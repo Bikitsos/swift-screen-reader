@@ -62,12 +62,16 @@ Name: "{autoprograms}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
-Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "SwiftScreenReader"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Flags: uninsdeletevalue; Tasks: startup
+; Not when the app was set to start as administrator through its scheduled task (both would race at logon).
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "SwiftScreenReader"; ValueData: """{app}\{#MyAppExeName}"" --minimized"; Flags: uninsdeletevalue; Tasks: startup; Check: not AdminTaskExists
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
-; Silent installs come from the in-app updater: restart the app as the original (non-elevated) user.
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--minimized"; Flags: nowait runasoriginaluser; Check: WizardSilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent; Check: not AdminTaskExists
+Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""{#MyAppName}"""; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runhidden; Check: AdminTaskExists
+; Silent installs come from the in-app updater: restart the app as the original (non-elevated) user,
+; or as administrator through its scheduled task if it was set up to run that way.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--minimized"; Flags: nowait runasoriginaluser; Check: WizardSilent and not AdminTaskExists
+Filename: "{sys}\schtasks.exe"; Parameters: "/Run /TN ""{#MyAppName}"""; Flags: nowait runhidden; Check: WizardSilent and AdminTaskExists
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
@@ -77,3 +81,22 @@ Type: filesandordirs; Name: "{userappdata}\{#MyAppName}"
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "KillApp"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyCliExeName}"; Flags: runhidden; RunOnceId: "KillCli"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""{#MyAppName}"" /F"; Flags: runhidden; RunOnceId: "RemoveTask"
+
+[Code]
+var
+  AdminTaskChecked: Boolean;
+  AdminTaskFound: Boolean;
+
+function AdminTaskExists: Boolean;
+var
+  ResultCode: Integer;
+begin
+  if not AdminTaskChecked then
+  begin
+    AdminTaskFound := Exec(ExpandConstant('{sys}\schtasks.exe'), '/Query /TN "{#MyAppName}"', '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+    AdminTaskChecked := True;
+  end;
+  Result := AdminTaskFound;
+end;
