@@ -74,7 +74,7 @@ Every capture made through the running app (shortcut, **Capture now**, the comma
 
 1. The screenshot is saved.
 2. All monitors are covered with a dark screen: **Reading amount...**, then **Processing payment...** with the amount and a spinner. Mouse clicks and keys are swallowed.
-3. The amount is read with Windows OCR: the number after the label (default `Subtotal`) on the same line or the next one. `12.50`, `1,234.56`, `1.234,56`, `€ 12,50` are all understood.
+3. The amount is read with Windows OCR: the number after the label (default `Subtotal`) on the same line, the next one, or just before it. `12.50`, `1,234.56`, `1.234,56`, `€ 12,50` are all understood. Because Windows OCR sometimes drops a number or reads `00` as the letters `O O`, the screenshot is read in up to five prepared versions (original, dark text on light, with a border, larger), letters that look like digits are fixed inside numbers (`7.OO` → `7.00`), and truncated reads (`45.`) are ignored. An amount is used only when two reads agree or a single clear read is contradicted by none; otherwise nothing is charged. This usually takes 10-30 ms. The log and the `.json` list each read when more than two were needed.
 4. The amount is sent to the card terminal. For now this is a simulator that approves every payment after a short delay (default 2 s).
 5. The result is shown:
    - **Transaction successful** (green) with the amount. After 2 seconds it closes by itself and the app **presses the POS button you picked** (see below), so the operator doesn't have to touch anything.

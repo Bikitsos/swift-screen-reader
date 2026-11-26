@@ -997,11 +997,15 @@ class MainWindow(QMainWindow):
             return
         finally:
             QApplication.restoreOverrideCursor()
-        amount = format_amount(result.amount, self.settings.currency) if result.amount is not None else "not found"
+        amount = format_amount(result.amount, self.settings.currency) if result.amount is not None else (
+            f"not found ({result.reason})")
         ok = result.amount is not None
         self.ocr_result.setStyleSheet(f"color: {'#2e7d32' if ok else '#c62828'};")
-        self.ocr_result.setText(f"Amount: {amount}\nRead: {result.text or '(no text)'}  ({result.ms} ms)")
+        self.ocr_result.setText(f"Amount: {amount}\nRead: {result.text or '(no text)'}  "
+                                f"({result.ms} ms, {len(result.reads)} image variants)")
         logging.info("OCR test: read %r, amount %s (%d ms)", result.text, amount, result.ms)
+        for name, text, found in result.reads:
+            logging.info("  OCR %s: %r -> %s", name, text, found)
 
     def select_area(self) -> None:
         if self._selector is not None:
@@ -1236,6 +1240,12 @@ class MainWindow(QMainWindow):
     # -- window / tray behaviour ----------------------------------------------
 
     def show_window(self) -> None:
+        if sys.platform == "win32" and self.isVisible():
+            import ctypes
+
+            if not ctypes.windll.user32.IsWindowVisible(ctypes.c_void_p(int(self.winId()))):
+                # Qt thinks it is shown but Windows hid it (a launcher's hidden show flag): show it again.
+                self.hide()
         self.showNormal()
         self.raise_()
         self.activateWindow()

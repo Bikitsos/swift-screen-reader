@@ -25,6 +25,8 @@ READ = "read"  # OCR only, payment turned off
 NO_AMOUNT = "no_amount"
 ZERO = "zero"
 FINISHED = {READ, NO_AMOUNT, ZERO, APPROVED, DECLINED, ERROR}
+# Log every variant read when more than the usual two were needed.
+AGREEING_LOG_THRESHOLD = 2
 
 
 def format_amount(amount: Decimal | None, currency: str = "") -> str:
@@ -48,6 +50,7 @@ class Transaction:
     message: str = ""
     ocr_lines: list[str] = field(default_factory=list)
     ocr_ms: int = 0
+    ocr_reads: list = field(default_factory=list)
     amount: Decimal | None = None
     amount_text: str = ""
     terminal: str = ""
@@ -97,6 +100,7 @@ class Transaction:
                 "lines": self.ocr_lines,
                 "amount_text": self.amount_text,
                 "ms": self.ocr_ms,
+                "reads": [{"variant": n, "text": t, "amount": a} for n, t, a in self.ocr_reads],
             },
             "amount": str(self.amount) if self.amount is not None else None,
             "currency": self.currency,
@@ -168,11 +172,16 @@ class TransactionRunner(QObject):
             tx.status, tx.message = NO_AMOUNT, str(exc)
             return
         tx.ocr_lines, tx.ocr_ms, tx.amount, tx.amount_text = result.lines, result.ms, result.amount, result.amount_text
-        _log(tx, "OCR read %r in %d ms", result.text, result.ms)
+        tx.ocr_reads = result.reads
+        _log(tx, "OCR read %r in %d ms (%d of %d image variants)", result.text, result.ms, len(result.reads),
+             len(ocr.VARIANTS))
+        if len(result.reads) > AGREEING_LOG_THRESHOLD or tx.amount is None:
+            for name, text, found in result.reads:
+                _log(tx, "  OCR %s: %r -> %s", name, text, found)
         if tx.amount is None:
             found = result.text or "no text"
             tx.status = NO_AMOUNT
-            tx.message = f"No amount found after \u201c{tx.label}\u201d (read: {found})"
+            tx.message = f"No clear amount after \u201c{tx.label}\u201d: {result.reason} (read: {found})"
             return
         _log(tx, "amount %s (from %r)", tx.amount_display, tx.amount_text)
         if not tx.payment:

@@ -30,6 +30,7 @@ TOKEN_QUERY = 0x0008
 TOKEN_ELEVATION = 20
 GA_ROOT = 2
 CREATE_NO_WINDOW = 0x08000000
+SW_SHOWNORMAL = 1
 
 if sys.platform == "win32":
     from ctypes import wintypes
@@ -163,7 +164,8 @@ def relaunch_elevated(*args: str) -> str:
     info.lpFile = program
     info.lpParameters = " ".join(_quote(a) for a in arguments)
     info.lpDirectory = str(Path(program).parent)
-    info.nShow = 0
+    # Not SW_HIDE: Windows applies this to the new copy's first window, which would then stay invisible.
+    info.nShow = SW_SHOWNORMAL
     if _shell32.ShellExecuteExW(ctypes.byref(info)):
         return ""
     error = ctypes.get_last_error()
