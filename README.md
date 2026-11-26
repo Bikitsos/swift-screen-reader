@@ -168,6 +168,8 @@ Exit codes: `0` success, `1` capture failed (for example no area selected yet, o
 
 `SwiftScreenReader.exe --capture [-o FILE] [--area X,Y,W,H]` does the same as `capture` but has no console window, so check its exit code or use a fixed output file.
 
+**Calling it from the POS or another program:** use `SwiftScreenReader.exe --capture`. A console program such as `SwiftScreenReaderCli.exe` gets a console window when a windowed program starts it, and that window can cover the capture area at the moment of the screenshot (the amount is then not read). `SwiftScreenReaderCli.exe` hides such a window itself and waits a quarter of a second before capturing, but `--capture` never opens one.
+
 ### HTTP endpoint
 
 Enabled by default on `127.0.0.1:8765` (change the port or turn it off in the window). It only listens on the local machine.

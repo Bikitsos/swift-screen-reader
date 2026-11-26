@@ -18,6 +18,7 @@ from . import APP_NAME, EXE_NAME, __version__, ipc
 
 COMMANDS = ("capture", "select", "show", "status", "quit")
 START_TIMEOUT = 20.0
+CONSOLE_HIDE_SECONDS = 0.25
 
 
 def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
@@ -76,10 +77,32 @@ def _capture_direct(area_text: str | None, output: str | None) -> dict:
     return {"ok": True, "path": str(path), "direct": True}
 
 
+def hide_own_console() -> bool:
+    """Hide the console window Windows opened just for us (we were started by a program, not a terminal).
+
+    Otherwise that window can cover the capture area at the moment of the screenshot.
+    """
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    processes = (ctypes.c_uint32 * 4)()
+    if kernel32.GetConsoleProcessList(processes, 4) != 1:
+        return False  # a shared console, e.g. a terminal the user typed the command in: leave it
+    hwnd = kernel32.GetConsoleWindow()
+    if not hwnd:
+        return False
+    ctypes.windll.user32.ShowWindow(ctypes.c_void_p(hwnd), 0)  # SW_HIDE
+    return True
+
+
 def run(argv: list[str] | None = None, prog: str | None = None) -> int:
     args = build_parser(prog).parse_args(argv)
     output = str(Path(args.output).resolve()) if args.output else None
 
+    if args.command == "capture" and hide_own_console():
+        time.sleep(CONSOLE_HIDE_SECONDS)  # let the screen repaint without the window
     if args.command == "capture":
         message = {"cmd": "capture", "area": args.area, "output": output}
         result = None if args.direct else ipc.request(message)
