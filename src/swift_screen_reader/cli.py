@@ -1,5 +1,6 @@
-"""Command line: ask the running service for a screenshot (fast), or capture directly if it isn't running.
+"""Command line: ask the tray app for a capture, so all its settings apply (area, folder, OCR, payment).
 
+If the app isn't running, `capture` starts it hidden in the tray first; `--direct` only saves a screenshot.
 Prints the saved file path on success. Exit codes: 0 ok, 1 capture/command failed, 2 bad arguments,
 3 the service is not running (status/quit only).
 """
@@ -10,27 +11,43 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import APP_NAME, EXE_NAME, __version__, ipc
 
 COMMANDS = ("capture", "select", "show", "status", "quit")
+START_TIMEOUT = 20.0
 
 
 def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description=f"{APP_NAME}: save a screenshot of the preselected screen area.",
-        epilog="Without the tray service running, 'capture' still works but starts a little slower.",
+        description=f"{APP_NAME}: capture the preselected screen area with the app's settings "
+                    "(area, folder, amount reading, payment).",
+        epilog="If the app isn't running, 'capture' starts it in the tray first (a few seconds), "
+               "so all its settings apply. --direct only saves a screenshot, without starting the app.",
     )
     parser.add_argument("command", nargs="?", default="capture", choices=COMMANDS,
                         help="capture (default), select (choose the area), show (open the window), status, quit")
     parser.add_argument("-o", "--output", metavar="FILE", help="save to this .png file instead of the screenshots folder")
     parser.add_argument("--area", metavar="X,Y,W,H", help="capture this area (physical pixels) instead of the saved one")
-    parser.add_argument("--direct", action="store_true", help="capture in this process even if the service is running")
+    parser.add_argument("--direct", action="store_true",
+                        help="only save a screenshot in this process: no app, no amount reading or payment")
     parser.add_argument("--json", action="store_true", help="print the full JSON result")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return parser
+
+
+def start_service(timeout: float = START_TIMEOUT) -> bool:
+    """Start the tray app hidden and wait until it answers on its pipe."""
+    launch_gui("--minimized")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        if ipc.request({"cmd": "ping"}) is not None:
+            return True
+    return False
 
 
 def launch_gui(*args: str) -> None:
@@ -64,7 +81,13 @@ def run(argv: list[str] | None = None, prog: str | None = None) -> int:
     output = str(Path(args.output).resolve()) if args.output else None
 
     if args.command == "capture":
-        result = None if args.direct else ipc.request({"cmd": "capture", "area": args.area, "output": output})
+        message = {"cmd": "capture", "area": args.area, "output": output}
+        result = None if args.direct else ipc.request(message)
+        if result is None and not args.direct:
+            if start_service():
+                result = ipc.request(message)
+            else:
+                print(f"{APP_NAME} did not start; saving the screenshot only.", file=sys.stderr)
         if result is None:
             result = _capture_direct(args.area, output)
     elif args.command in ("select", "show"):

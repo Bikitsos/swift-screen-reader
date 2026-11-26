@@ -7,6 +7,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from dataclasses import asdict
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -1030,8 +1031,15 @@ def main(argv: list[str] | None = None) -> int:
     args, qt_args = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
 
     # Single instance: hand the request to the running copy instead of starting another one.
-    reply = ipc.request({"cmd": "select" if args.select else ("ping" if args.minimized else "show")})
-    if reply is not None:
+    request = {"cmd": "select" if args.select else ("ping" if args.minimized else "show")}
+    if ipc.request(request) is not None:
+        return 0
+    if not ipc.acquire_instance_lock():
+        # Another copy is starting right now; pass the request on once it is listening.
+        for _ in range(100):
+            time.sleep(0.1)
+            if ipc.request(request) is not None:
+                break
         return 0
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -1051,7 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow(emitter, log_file)
     if not window.start_service():
-        QMessageBox.critical(None, APP_NAME, f"{APP_NAME} is already running or its pipe is in use.")
+        QMessageBox.critical(None, APP_NAME, f"{APP_NAME} could not open its pipe: another copy may be running.")
         return 1
     if args.select or window.settings.area is None and not args.minimized:
         window.show_window()

@@ -15,7 +15,7 @@ Built with [PySide6](https://doc.qt.io/qtforpython/) and managed with [uv](https
   - `SwiftScreenReaderCli.exe`: console tool that prints the saved file path (Qt-free, starts fast)
   - `SwiftScreenReader.exe --capture`: same, for launchers and shortcuts that want a windowed exe
   - `http://127.0.0.1:8765/capture` (JSON with the path) or `/capture.png` (the image itself, nothing saved)
-- If the service isn't running, the command line captures directly instead of failing
+- With no arguments the command line uses all the app's settings, starting the app in the tray if it isn't running
 - PNG output to a folder of your choice, with a file name pattern (`{timestamp}`, `{date}`, `{time}`) or a fixed name such as `latest.png` that is overwritten on each capture
 - Files are written atomically, so a program watching the folder never reads a half-written image
 - Optional copy to the clipboard and tray notification after each capture
@@ -83,7 +83,7 @@ Every capture made through the running app (shortcut, **Capture now**, the comma
 
 Until the result is tapped away, new captures are refused (the shortcut is ignored, the command line gets an error, HTTP returns 409), so a double press never charges twice. The payment screen is hidden from screen capture (Windows 10 2004 or later). It is not a Windows lock: no password is needed, and system keys such as the Windows key and Ctrl+Alt+Del still work.
 
-On the **Payment** page you can change the label, test the OCR on the current screen, choose the terminal and currency, set the simulated processing time, or turn the payment (or the OCR) off. With payment off, the amount is only read and recorded, without the payment screen. A command-line capture made while the app isn't running (`--direct`, or no service) only saves the screenshot.
+On the **Payment** page you can change the label, test the OCR on the current screen, choose the terminal and currency, set the simulated processing time, or turn the payment (or the OCR) off. With payment off, the amount is only read and recorded, without the payment screen. A command-line capture with `--direct` only saves the screenshot.
 
 ### Transaction records
 
@@ -126,19 +126,22 @@ Everything the app does is written to `logs\activity.log` next to the exe (or `%
 ### Taking a screenshot
 
 ```powershell
-SwiftScreenReaderCli.exe                          # capture the saved area, print the file path
+SwiftScreenReaderCli.exe                          # capture with all the app's settings, print the file path
 SwiftScreenReaderCli.exe -o C:\out\shot.png       # save to a specific file
 SwiftScreenReaderCli.exe --area 0,0,800,600       # capture another area this time
 SwiftScreenReaderCli.exe --json                   # {"ok": true, "path": "..."}
+SwiftScreenReaderCli.exe --direct                 # screenshot only: no app, no amount reading or payment
 SwiftScreenReaderCli.exe select                   # choose the area (starts the app if needed)
 SwiftScreenReaderCli.exe show                     # open the window
 SwiftScreenReaderCli.exe status                   # is the service running?
 SwiftScreenReaderCli.exe quit                     # stop the service
 ```
 
+With no arguments the command line uses everything set in the app: the capture area, screenshot folder and file name, amount reading and the payment screen. It hands the capture to the running app; if the app isn't running, it starts it hidden in the tray first (a few seconds the first time) and then captures. Only if the app can't start does it fall back to saving the screenshot alone. `--area` and `-o` override the area or the file for that one capture. The command returns as soon as the screenshot is saved; the payment continues on screen.
+
 From source, use `uv run screen-reader` instead of `SwiftScreenReaderCli.exe`.
 
-Exit codes: `0` success, `1` capture failed (for example no area selected yet), `2` invalid arguments, `3` the service is not running (`status` and `quit` only).
+Exit codes: `0` success, `1` capture failed (for example no area selected yet, or a transaction is still on screen), `2` invalid arguments, `3` the service is not running (`status` and `quit` only).
 
 `SwiftScreenReader.exe --capture [-o FILE] [--area X,Y,W,H]` does the same as `capture` but has no console window, so check its exit code or use a fixed output file.
 
